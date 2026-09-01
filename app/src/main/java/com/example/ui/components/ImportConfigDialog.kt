@@ -92,7 +92,7 @@ fun ImportConfigDialog(
                             color = TextPrimary
                         )
                         Text(
-                            text = "Supports trojan://, vless://, vmess://, ss://, ssh://",
+                            text = "Supports .nikuvpn.tl, trojan://, vless://, vmess://, ss://, ssh://",
                             style = MaterialTheme.typography.bodySmall,
                             color = NeonCyan
                         )

@@ -177,6 +177,8 @@ class V2TunnelVpnService : VpnService() {
         }
     }
 
+    private var pingJob: Job? = null
+
     private suspend fun attemptTunnelEstablishment(profile: VpnProfile): Boolean {
         cleanupResources()
         isRunning.set(true)
@@ -186,17 +188,24 @@ class V2TunnelVpnService : VpnService() {
         startForeground(NOTIFICATION_ID, createNotification("Connecting to ${profile.name}..."))
 
         return try {
-            // 1. If VMess protocol, build Xray JSON configuration
+            // 1. Initial Host Ping / Latency Check (HTTP Custom style)
+            val initialPingMs = measureInitialLatency(profile)
+            if (initialPingMs > 0) {
+                VpnLogManager.log(LogLevel.INFO, "PING", "[PING] Server Latency: $initialPingMs ms")
+                VpnController.updateMetrics { it.copy(pingMs = initialPingMs) }
+            }
+
+            // 2. If VMess protocol, build Xray JSON configuration
             if (profile.protocol == VpnProtocol.VMESS) {
                 val xrayConfigJson = XrayVmessConfigBuilder.buildConfig(profile, localSocksPort = 10808)
                 VpnLogManager.log(LogLevel.INFO, "XRay CONFIG", "[XRay CONFIG] Generated Xray VMess JSON configuration for ${profile.server}:${profile.port}")
             }
 
-            // 2. Dispatch to the dedicated protocol backend (SSH, VMess, VLESS, Trojan, SS, SOCKS5)
+            // 3. Dispatch to the dedicated protocol backend (SSH, VMess, VLESS, Trojan, SS, SOCKS5)
             val backend = VpnBackendDispatcher.dispatch(this@V2TunnelVpnService, profile)
             activeBackend = backend
 
-            // 3. Start Local SOCKS listener on 127.0.0.1:10808 with active backend
+            // 4. Start Local SOCKS listener on 127.0.0.1:10808 with active backend
             val socks = LocalSocksServer(this@V2TunnelVpnService, backend, port = 10808)
             val socksStarted = socks.start()
             if (!socksStarted) {
@@ -205,7 +214,7 @@ class V2TunnelVpnService : VpnService() {
             socksServer = socks
             VpnLogManager.log(LogLevel.INFO, "SOCKS5", "[SOCKS5] 127.0.0.1:10808 ready for Tun2Socks traffic")
 
-            // 4. Perform protocol-specific handshake verification
+            // 5. Perform protocol-specific handshake verification
             val handshakeResult = backend.verifyHandshake()
             if (handshakeResult.isFailure) {
                 val error = handshakeResult.exceptionOrNull()
@@ -214,7 +223,7 @@ class V2TunnelVpnService : VpnService() {
                 throw error ?: RuntimeException(errorMsg)
             }
 
-            // 5. Establish Android TUN interface with IPv4 + IPv6 leak protection
+            // 6. Establish Android TUN interface with IPv4 + IPv6 leak protection
             VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] Establishing Android TUN interface...")
             val builder = Builder()
                 .setSession("V2Tunnel: ${profile.protocol.displayName}")
@@ -233,7 +242,7 @@ class V2TunnelVpnService : VpnService() {
             vpnInterface = vpnPfd
             VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] TUN interface active (MTU: 1500, IPv4: 10.8.0.2/24, IPv6: fd00::2/120)")
 
-            // 6. Forward TUN traffic through Tun2Socks -> SOCKS:10808 -> Backend
+            // 7. Forward TUN traffic through Tun2Socks -> SOCKS:10808 -> Backend
             val router = TunPacketRouter(
                 vpnService = this@V2TunnelVpnService,
                 tunInterface = vpnPfd,
@@ -243,7 +252,7 @@ class V2TunnelVpnService : VpnService() {
             packetRouter = router
             router.start()
 
-            // 7. Mandatory Connectivity Test through Tunnel
+            // 8. Mandatory Connectivity Test through Tunnel
             VpnLogManager.log(LogLevel.INFO, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Probing connectivity through tunnel...")
             val testSuccess = runConnectivityTests(profile)
             if (!testSuccess) {
@@ -251,18 +260,50 @@ class V2TunnelVpnService : VpnService() {
             }
             VpnLogManager.log(LogLevel.INFO, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Connectivity probe passed successfully.")
 
-            // 8. Set status to CONNECTED
+            // 9. Start routing and set status to CONNECTED
+            VpnLogManager.log(LogLevel.INFO, "TUN", "[TUN] Routing started")
             VpnController.setConnectionState(VpnConnectionState.CONNECTED)
-            VpnLogManager.log(LogLevel.INFO, "TRAFFIC", "[TRAFFIC] Tunnel ONLINE. Real-time traffic monitoring started.")
+            VpnLogManager.log(LogLevel.INFO, "VPN", "[VPN] CONNECTED")
 
-            // 9. Start real metrics tracker
+            // 10. Start real metrics tracker & auto-ping loop
             startMetricsLoop(profile, backend, socks, router)
+            startAutoPingLoop(profile)
             true
 
         } catch (e: Exception) {
             val failureMessage = e.localizedMessage ?: e.javaClass.simpleName
             VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] Connection attempt failed: $failureMessage")
             false
+        }
+    }
+
+    private suspend fun measureInitialLatency(profile: VpnProfile): Int {
+        return try {
+            val targetHost = if (profile.remoteProxyEnabled && profile.remoteProxyHost.isNotBlank()) profile.remoteProxyHost else profile.server
+            val targetPort = if (profile.remoteProxyEnabled && profile.remoteProxyPort > 0) profile.remoteProxyPort else profile.port
+            VpnPingTester.ping(targetHost, targetPort, timeoutMs = 2500)
+        } catch (e: Exception) {
+            -1
+        }
+    }
+
+    private fun startAutoPingLoop(profile: VpnProfile) {
+        pingJob?.cancel()
+        pingJob = serviceScope.launch {
+            val targetHost = if (profile.remoteProxyEnabled && profile.remoteProxyHost.isNotBlank()) profile.remoteProxyHost else profile.server
+            val targetPort = if (profile.remoteProxyEnabled && profile.remoteProxyPort > 0) profile.remoteProxyPort else profile.port
+
+            while (isActive && isRunning.get()) {
+                delay(8000) // Periodic Auto-Ping every 8 seconds
+                if (!isRunning.get()) break
+                val ping = VpnPingTester.ping(targetHost, targetPort, timeoutMs = 3000)
+                if (ping > 0) {
+                    VpnLogManager.log(LogLevel.INFO, "PING", "[PING] Auto Ping: $ping ms")
+                    VpnController.updateMetrics { it.copy(pingMs = ping) }
+                } else {
+                    VpnLogManager.log(LogLevel.WARN, "PING", "[PING] Timeout")
+                }
+            }
         }
     }
 
@@ -289,6 +330,17 @@ class V2TunnelVpnService : VpnService() {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         var lastRx = 0L
         var lastTx = 0L
+        var resolvedPublicIp = profile.server
+
+        serviceScope.launch {
+            delay(1500) // Allow tunnel route to stabilize
+            val realIp = VpnPingTester.fetchPublicIp()
+            if (realIp != "Unknown") {
+                resolvedPublicIp = realIp
+                VpnController.updateMetrics { it.copy(publicIp = realIp) }
+                VpnLogManager.log(LogLevel.INFO, "IP", "[IP] Public IP: $realIp")
+            }
+        }
 
         timerJob = serviceScope.launch {
             while (isActive && isRunning.get()) {
@@ -320,7 +372,7 @@ class V2TunnelVpnService : VpnService() {
                         totalDownloadBytes = currentRx,
                         totalUploadBytes = currentTx,
                         country = profile.countryCode,
-                        publicIp = profile.server
+                        publicIp = resolvedPublicIp
                     )
                 }
 
@@ -340,6 +392,8 @@ class V2TunnelVpnService : VpnService() {
 
     private fun cleanupResources() {
         isRunning.set(false)
+        pingJob?.cancel()
+        pingJob = null
         trafficJob?.cancel()
         timerJob?.cancel()
         packetRouter?.stop()

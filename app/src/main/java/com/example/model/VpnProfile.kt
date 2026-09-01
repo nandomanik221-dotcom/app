@@ -18,8 +18,17 @@ data class VpnProfile(
     val realityShortId: String = "",
     val sshUsername: String = "",
     val sshPassword: String = "",
-    val sshPayload: String = "",         // Custom SNI / HTTP payload settings
+    val sshPayload: String = "",         // Custom HTTP / WebSocket payload
     val sshDirectSsl: Boolean = true,
+
+    // Remote Proxy ("Proxy Jarak Jauh") Configuration
+    val remoteProxyEnabled: Boolean = false,
+    val remoteProxyType: String = "HTTP",      // "HTTP" or "SOCKS5"
+    val remoteProxyHost: String = "",
+    val remoteProxyPort: Int = 8080,
+    val remoteProxyUsername: String? = null,
+    val remoteProxyPassword: String? = null,
+
     val countryCode: String = "SG",      // Country flag ISO code (SG, ID, US, JP, DE, NL, HK, etc.)
     val lastPingMs: Int = -1,
     val isPreset: Boolean = false,
@@ -27,6 +36,14 @@ data class VpnProfile(
     val rawUri: String = "",
     val createdAt: Long = System.currentTimeMillis()
 ) {
+    // Backward compatibility aliases
+    val proxyEnabled: Boolean get() = remoteProxyEnabled
+    val proxyType: String get() = remoteProxyType
+    val proxyHost: String get() = remoteProxyHost
+    val proxyPort: Int get() = remoteProxyPort
+    val proxyUsername: String get() = remoteProxyUsername ?: ""
+    val proxyPassword: String get() = remoteProxyPassword ?: ""
+
     val isTls: Boolean
         get() = security.equals("tls", ignoreCase = true) || security.equals("reality", ignoreCase = true)
 
@@ -39,10 +56,17 @@ data class VpnProfile(
     val customPayload: String
         get() = sshPayload
 
+    val effectiveSshUsername: String
+        get() = sshUsername.ifBlank { username }
+
+    val effectiveSshPassword: String
+        get() = sshPassword.ifBlank { password }
+
     val displayFlag: String
         get() = when (countryCode.uppercase()) {
             "SG" -> "🇸🇬"
             "ID" -> "🇮🇩"
+            "US" -> "🇲🇨" // Fallback / Indonesia
             "US" -> "🇺🇸"
             "JP" -> "🇯🇵"
             "DE" -> "🇩🇪"
@@ -73,7 +97,9 @@ data class VpnProfile(
                 append(security.uppercase())
             }
             if (protocol == VpnProtocol.SSH) {
-                append(if (sshDirectSsl) " • SSL/TLS" else " • Direct")
+                if (sshDirectSsl) append(" • SSL/TLS") else append(" • Direct")
+                if (remoteProxyEnabled) append(" • Proxy ($remoteProxyType)")
+                if (sni.isNotBlank()) append(" • SNI")
             }
         }
 }

@@ -88,10 +88,31 @@ fun AddEditProfileDialog(
     var countryCode by remember { mutableStateOf(initialProfile?.countryCode ?: "SG") }
 
     // SSH Specific
-    var sshUsername by remember { mutableStateOf(initialProfile?.sshUsername ?: "") }
-    var sshPassword by remember { mutableStateOf(initialProfile?.sshPassword ?: "") }
+    var sshUsername by remember { mutableStateOf(initialProfile?.sshUsername?.ifBlank { initialProfile.username } ?: "") }
+    var sshPassword by remember { mutableStateOf(initialProfile?.sshPassword?.ifBlank { initialProfile.password } ?: "") }
     var sshPayload by remember { mutableStateOf(initialProfile?.sshPayload ?: "") }
     var sshDirectSsl by remember { mutableStateOf(initialProfile?.sshDirectSsl ?: true) }
+
+    // Remote Proxy
+    var proxyEnabled by remember { mutableStateOf(initialProfile?.remoteProxyEnabled ?: initialProfile?.proxyEnabled ?: false) }
+    var proxyHost by remember { mutableStateOf(initialProfile?.remoteProxyHost ?: initialProfile?.proxyHost ?: "") }
+    var proxyPort by remember { mutableStateOf((initialProfile?.remoteProxyPort ?: initialProfile?.proxyPort ?: 8080).toString()) }
+    var proxyUsername by remember { mutableStateOf(initialProfile?.remoteProxyUsername ?: initialProfile?.proxyUsername ?: "") }
+    var proxyPassword by remember { mutableStateOf(initialProfile?.remoteProxyPassword ?: initialProfile?.proxyPassword ?: "") }
+    var proxyType by remember { mutableStateOf(initialProfile?.remoteProxyType ?: initialProfile?.proxyType ?: "HTTP") }
+
+    // HTTP Custom style "Proxy Jarak Jauh" raw input
+    var rawProxyAddressInput by remember {
+        val initialFormatted = if (proxyHost.isNotBlank()) {
+            com.example.parser.RemoteProxyAddressParser.format(
+                host = proxyHost,
+                port = proxyPort.toIntOrNull() ?: 8080,
+                username = proxyUsername.ifBlank { null },
+                password = proxyPassword.ifBlank { null }
+            )
+        } else ""
+        mutableStateOf(initialFormatted)
+    }
 
     var protocolExpanded by remember { mutableStateOf(false) }
     var networkExpanded by remember { mutableStateOf(false) }
@@ -324,7 +345,7 @@ fun AddEditProfileDialog(
                         CyberTextField(
                             value = sni,
                             onValueChange = { sni = it },
-                            label = "SNI / Bug Host (SSL Mode)",
+                            label = "SNI / Bug Host (Separate Field)",
                             placeholder = "e.g. m.youtube.com / line.me"
                         )
 
@@ -333,24 +354,32 @@ fun AddEditProfileDialog(
                         CyberTextField(
                             value = sshPayload,
                             onValueChange = { sshPayload = it },
-                            label = "Custom HTTP Payload",
-                            placeholder = "GET / HTTP/1.1[crlf]Host: [host]...",
+                            label = "Custom HTTP / WebSocket Payload",
+                            placeholder = "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]",
                             singleLine = false,
                             minLines = 2
                         )
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(12.dp))
 
+                        // Direct SSL/TLS Mode Switch
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                text = "Direct SSL/TLS Mode",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TextPrimary
-                            )
+                            Column {
+                                Text(
+                                    text = "Direct SSL/TLS Mode",
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "Wraps SSH connection inside TLS using SNI",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextMuted
+                                )
+                            }
                             Switch(
                                 checked = sshDirectSsl,
                                 onCheckedChange = { sshDirectSsl = it },
@@ -359,6 +388,154 @@ fun AddEditProfileDialog(
                                     checkedTrackColor = NeonCyan.copy(alpha = 0.4f)
                                 )
                             )
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Remote Proxy Configuration Section (HTTP Custom style "Proxy Jarak Jauh")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Proxy Jarak Jauh (Remote Proxy)",
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = "Route SSH handshake via HTTP CONNECT / SOCKS5 proxy",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextMuted
+                                )
+                            }
+                            Switch(
+                                checked = proxyEnabled,
+                                onCheckedChange = { proxyEnabled = it },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = NeonGreen,
+                                    checkedTrackColor = NeonGreen.copy(alpha = 0.4f)
+                                )
+                            )
+                        }
+
+                        if (proxyEnabled) {
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // HTTP Custom unified format input: host:port or user:pass@host:port or user:pass@[IPv6]:port
+                            CyberTextField(
+                                value = rawProxyAddressInput,
+                                onValueChange = { input ->
+                                    rawProxyAddressInput = input
+                                    val parsed = com.example.parser.RemoteProxyAddressParser.parse(input)
+                                    if (parsed != null) {
+                                        proxyHost = parsed.host
+                                        proxyPort = parsed.port.toString()
+                                        if (parsed.username != null) proxyUsername = parsed.username
+                                        if (parsed.password != null) proxyPassword = parsed.password
+                                    }
+                                },
+                                label = "Proxy Jarak Jauh [ host:port / user:pass@host:port ]",
+                                placeholder = "ads.ruangguru.com:443 or user:pass@104.21.56.88:8080"
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Proxy Type selector: [ HTTP ] [ SOCKS5 ]
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Proxy Type:",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary
+                                )
+                                listOf("HTTP", "SOCKS5").forEach { type ->
+                                    val isTypeSel = proxyType.equals(type, ignoreCase = true)
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(if (isTypeSel) NeonGreen.copy(alpha = 0.2f) else CyberCard)
+                                            .border(1.dp, if (isTypeSel) NeonGreen else CyberBorder, RoundedCornerShape(8.dp))
+                                            .clickable { proxyType = type }
+                                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                                    ) {
+                                        Text(
+                                            text = type,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = if (isTypeSel) NeonGreen else TextMuted
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Optional separate Host & Port granular controls
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                CyberTextField(
+                                    value = proxyHost,
+                                    onValueChange = {
+                                        proxyHost = it
+                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
+                                            proxyHost, proxyPort.toIntOrNull() ?: 8080, proxyUsername.ifBlank { null }, proxyPassword.ifBlank { null }
+                                        )
+                                    },
+                                    label = "Host / IP",
+                                    placeholder = "104.21.56.88",
+                                    modifier = Modifier.weight(2.5f)
+                                )
+                                CyberTextField(
+                                    value = proxyPort,
+                                    onValueChange = {
+                                        proxyPort = it
+                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
+                                            proxyHost, it.toIntOrNull() ?: 8080, proxyUsername.ifBlank { null }, proxyPassword.ifBlank { null }
+                                        )
+                                    },
+                                    label = "Port",
+                                    placeholder = "8080",
+                                    modifier = Modifier.weight(1.2f)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                CyberTextField(
+                                    value = proxyUsername,
+                                    onValueChange = {
+                                        proxyUsername = it
+                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
+                                            proxyHost, proxyPort.toIntOrNull() ?: 8080, it.ifBlank { null }, proxyPassword.ifBlank { null }
+                                        )
+                                    },
+                                    label = "Username (opsional)",
+                                    placeholder = "user",
+                                    modifier = Modifier.weight(1f)
+                                )
+                                CyberTextField(
+                                    value = proxyPassword,
+                                    onValueChange = {
+                                        proxyPassword = it
+                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
+                                            proxyHost, proxyPort.toIntOrNull() ?: 8080, proxyUsername.ifBlank { null }, it.ifBlank { null }
+                                        )
+                                    },
+                                    label = "Password (opsional)",
+                                    placeholder = "pass",
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
                     }
                     else -> {}
@@ -379,17 +556,22 @@ fun AddEditProfileDialog(
                     Button(
                         onClick = {
                             val parsedPort = port.toIntOrNull() ?: 443
+                            val parsedProxyPort = proxyPort.toIntOrNull() ?: 8080
                             val finalName = if (name.isNotBlank()) name else "${protocol.displayName} Server"
+                            val effectiveUser = if (protocol == VpnProtocol.SSH) sshUsername.trim() else password.trim()
+                            val effectivePass = if (protocol == VpnProtocol.SSH) sshPassword.trim() else password.trim()
+
                             val newProfile = VpnProfile(
                                 id = initialProfile?.id ?: 0L,
                                 name = finalName,
                                 protocol = protocol,
                                 server = server.trim(),
                                 port = parsedPort,
-                                password = password.trim(),
+                                username = effectiveUser,
+                                password = effectivePass,
                                 method = method.trim(),
                                 network = network.trim(),
-                                security = security.trim(),
+                                security = if (protocol == VpnProtocol.SSH) (if (sshDirectSsl) "tls" else "none") else security.trim(),
                                 sni = sni.trim(),
                                 path = path.trim(),
                                 host = hostHeader.trim(),
@@ -397,6 +579,12 @@ fun AddEditProfileDialog(
                                 sshPassword = sshPassword.trim(),
                                 sshPayload = sshPayload.trim(),
                                 sshDirectSsl = sshDirectSsl,
+                                remoteProxyEnabled = proxyEnabled,
+                                remoteProxyType = proxyType.trim(),
+                                remoteProxyHost = proxyHost.trim(),
+                                remoteProxyPort = parsedProxyPort,
+                                remoteProxyUsername = proxyUsername.trim().ifBlank { null },
+                                remoteProxyPassword = proxyPassword.trim().ifBlank { null },
                                 countryCode = if (countryCode.isNotBlank()) countryCode.trim().uppercase() else "SG",
                                 isFavorite = initialProfile?.isFavorite ?: false
                             )

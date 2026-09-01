@@ -145,7 +145,7 @@ fun ServerCard(
                             )
                         }
 
-                        DropdownMenu(
+                                DropdownMenu(
                             expanded = menuExpanded,
                             onDismissRequest = { menuExpanded = false },
                             modifier = Modifier.background(CyberCard)
@@ -159,8 +159,8 @@ fun ServerCard(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Share / Export URL", color = TextPrimary) },
-                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null, tint = TextSecondary) },
+                                text = { Text("Export .nikuvpn.tl File", color = TextPrimary) },
+                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null, tint = NeonGreen) },
                                 onClick = {
                                     menuExpanded = false
                                     onExport()

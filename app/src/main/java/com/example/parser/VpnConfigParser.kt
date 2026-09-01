@@ -13,10 +13,29 @@ object VpnConfigParser {
 
     fun parse(rawInput: String): List<VpnProfile> {
         val results = mutableListOf<VpnProfile>()
-        val lines = rawInput.trim().split("\r\n", "\n", "\r")
+        val trimmedInput = rawInput.trim()
+
+        // 1. Check if rawInput is a .nikuvpn.tl JSON configuration
+        if (NikuVpnProfileSerializer.isNikuVpnConfig(trimmedInput)) {
+            val nikuProfile = NikuVpnProfileSerializer.deserialize(trimmedInput)
+            if (nikuProfile != null) {
+                return listOf(nikuProfile)
+            }
+        }
+
+        val lines = trimmedInput.split("\r\n", "\n", "\r")
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isBlank() || trimmed.startsWith("#")) continue
+
+            if (NikuVpnProfileSerializer.isNikuVpnConfig(trimmed)) {
+                val nikuProfile = NikuVpnProfileSerializer.deserialize(trimmed)
+                if (nikuProfile != null) {
+                    results.add(nikuProfile)
+                    continue
+                }
+            }
+
             try {
                 when {
                     trimmed.startsWith("trojan://", ignoreCase = true) -> parseTrojan(trimmed)?.let { results.add(it) }

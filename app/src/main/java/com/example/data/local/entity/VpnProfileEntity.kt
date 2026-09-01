@@ -27,6 +27,15 @@ data class VpnProfileEntity(
     val sshPassword: String = "",
     val sshPayload: String = "",
     val sshDirectSsl: Boolean = true,
+
+    // Remote Proxy fields
+    val remoteProxyEnabled: Boolean = false,
+    val remoteProxyType: String = "HTTP",
+    val remoteProxyHost: String = "",
+    val remoteProxyPort: Int = 8080,
+    val remoteProxyUsername: String? = null,
+    val remoteProxyPassword: String? = null,
+
     val countryCode: String = "SG",
     val lastPingMs: Int = -1,
     val isPreset: Boolean = false,
@@ -36,6 +45,7 @@ data class VpnProfileEntity(
 ) {
     fun toDomain(): VpnProfile {
         val effectiveUsername = username.ifBlank { sshUsername }
+        val effectivePassword = password.ifBlank { sshPassword }
         return VpnProfile(
             id = id,
             name = name,
@@ -43,7 +53,7 @@ data class VpnProfileEntity(
             server = server,
             port = port,
             username = effectiveUsername,
-            password = password,
+            password = effectivePassword,
             method = method,
             network = network,
             security = security,
@@ -53,9 +63,15 @@ data class VpnProfileEntity(
             realityPublicKey = realityPublicKey,
             realityShortId = realityShortId,
             sshUsername = sshUsername.ifBlank { effectiveUsername },
-            sshPassword = sshPassword.ifBlank { password },
+            sshPassword = sshPassword.ifBlank { effectivePassword },
             sshPayload = sshPayload,
             sshDirectSsl = sshDirectSsl,
+            remoteProxyEnabled = remoteProxyEnabled,
+            remoteProxyType = remoteProxyType,
+            remoteProxyHost = remoteProxyHost,
+            remoteProxyPort = remoteProxyPort,
+            remoteProxyUsername = remoteProxyUsername,
+            remoteProxyPassword = remoteProxyPassword,
             countryCode = countryCode,
             lastPingMs = lastPingMs,
             isPreset = isPreset,
@@ -85,10 +101,16 @@ data class VpnProfileEntity(
                 host = domain.host,
                 realityPublicKey = domain.realityPublicKey,
                 realityShortId = domain.realityShortId,
-                sshUsername = effectiveUsername,
-                sshPassword = effectivePassword,
+                sshUsername = domain.sshUsername.ifBlank { effectiveUsername },
+                sshPassword = domain.sshPassword.ifBlank { effectivePassword },
                 sshPayload = domain.sshPayload,
                 sshDirectSsl = domain.sshDirectSsl,
+                remoteProxyEnabled = domain.remoteProxyEnabled,
+                remoteProxyType = domain.remoteProxyType,
+                remoteProxyHost = domain.remoteProxyHost,
+                remoteProxyPort = domain.remoteProxyPort,
+                remoteProxyUsername = domain.remoteProxyUsername,
+                remoteProxyPassword = domain.remoteProxyPassword,
                 countryCode = domain.countryCode,
                 lastPingMs = domain.lastPingMs,
                 isPreset = domain.isPreset,

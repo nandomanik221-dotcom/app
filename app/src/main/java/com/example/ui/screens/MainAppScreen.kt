@@ -198,13 +198,18 @@ fun MainAppScreen(
                                 Toast.makeText(context, "Deleted ${profile.name}", Toast.LENGTH_SHORT).show()
                             },
                             onExportProfile = { profile ->
-                                val uri = VpnConfigParser.exportToUri(profile)
-                                val sendIntent = android.content.Intent().apply {
-                                    action = android.content.Intent.ACTION_SEND
-                                    putExtra(android.content.Intent.EXTRA_TEXT, uri)
-                                    type = "text/plain"
+                                try {
+                                    val shareIntent = com.example.parser.NikuVpnProfileExporter.createShareFileIntent(context, profile)
+                                    context.startActivity(android.content.Intent.createChooser(shareIntent, "Export / Share .nikuvpn.tl Configuration"))
+                                } catch (e: Exception) {
+                                    val json = com.example.parser.NikuVpnProfileExporter.exportToJson(profile)
+                                    val sendIntent = android.content.Intent().apply {
+                                        action = android.content.Intent.ACTION_SEND
+                                        putExtra(android.content.Intent.EXTRA_TEXT, json)
+                                        type = "text/plain"
+                                    }
+                                    context.startActivity(android.content.Intent.createChooser(sendIntent, "Share VPN Configuration"))
                                 }
-                                context.startActivity(android.content.Intent.createChooser(sendIntent, "Share VPN Configuration"))
                             }
                         )
                     }
