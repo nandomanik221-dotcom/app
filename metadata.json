@@ -1,0 +1,7 @@
+{
+  "name": "V2Tunnel VPN",
+  "description": "High-performance VPN client supporting Trojan, SSH Tunnel, VMess, VLESS (Xray), Shadowsocks, custom SNI payloads, and real-time network telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
