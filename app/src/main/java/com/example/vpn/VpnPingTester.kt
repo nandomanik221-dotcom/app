@@ -52,7 +52,7 @@ object VpnPingTester {
             // Ping failed
         }
 
-        // Simulated reasonable jitter latency for display when server domain is mock
-        return@withContext (30..120).random()
+        // Real check failed or host unreachable
+        return@withContext -1
     }
 }

@@ -13,18 +13,21 @@ import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.model.LogLevel
 import com.example.model.VpnConnectionState
-import com.example.model.VpnProtocol
+import com.example.model.VpnProfile
+import com.example.vpn.socks.LocalSocksServer
+import com.example.vpn.tun2socks.TunPacketRouter
+import com.example.vpn.xray.XrayVmessClient
+import com.example.vpn.xray.XrayVmessConfigBuilder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.text.DecimalFormat
-import kotlin.random.Random
+import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
 
 class V2TunnelVpnService : VpnService() {
 
@@ -32,8 +35,12 @@ class V2TunnelVpnService : VpnService() {
     private val serviceScope = CoroutineScope(Dispatchers.IO)
     private var trafficJob: Job? = null
     private var timerJob: Job? = null
-    private var isRunning = false
+    private val isRunning = AtomicBoolean(false)
     private var startTimeMs = 0L
+
+    private var xrayClient: XrayVmessClient? = null
+    private var socksServer: LocalSocksServer? = null
+    private var packetRouter: TunPacketRouter? = null
 
     companion object {
         const val ACTION_CONNECT = "com.example.vpn.CONNECT"
@@ -111,7 +118,7 @@ class V2TunnelVpnService : VpnService() {
         )
 
         val profile = VpnController.activeProfile.value
-        val title = "V2Tunnel • ${profile?.name ?: "Connected"}"
+        val title = "V2Tunnel • ${profile?.name ?: "VPN Tunnel"}"
         val content = if (speedText.isNotBlank()) "$statusText | $speedText" else statusText
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
@@ -125,69 +132,52 @@ class V2TunnelVpnService : VpnService() {
             .build()
     }
 
-    private fun startTunnel(profile: com.example.model.VpnProfile?) {
-        if (isRunning) return
-        isRunning = true
+    private fun startTunnel(profile: VpnProfile?) {
+        if (isRunning.getAndSet(true)) return
         startTimeMs = System.currentTimeMillis()
 
         VpnController.setConnectionState(VpnConnectionState.CONNECTING)
-        VpnLogManager.log(LogLevel.INFO, "CORE", "Starting V2Tunnel VPN Engine...")
-        
+        VpnLogManager.log(LogLevel.INFO, "XRay START", "[XRay START] Initializing Xray-core backend engine...")
+
         startForeground(NOTIFICATION_ID, createNotification("Connecting to ${profile?.name ?: "Server"}..."))
 
         serviceScope.launch {
             try {
-                // 1. Initial Handshake simulation & protocol logs
-                val serverHost = profile?.server ?: "104.28.19.42"
-                val serverPort = profile?.port ?: 443
-                val protocol = profile?.protocol ?: VpnProtocol.TROJAN
-
-                VpnLogManager.log(LogLevel.CONN, "NET", "Resolving DNS for $serverHost...")
-                delay(120)
-                VpnLogManager.log(LogLevel.CONN, "NET", "Connecting TCP socket to $serverHost:$serverPort")
-                delay(150)
-
-                when (protocol) {
-                    VpnProtocol.TROJAN -> {
-                        VpnLogManager.log(LogLevel.TLS, "TROJAN", "Performing TLS 1.3 Client Hello (SNI: ${profile?.sni?.ifBlank { serverHost }})")
-                        delay(200)
-                        VpnLogManager.log(LogLevel.HANDSHAKE, "TROJAN", "SHA224 password verification successful")
-                        VpnLogManager.log(LogLevel.ROUTING, "TROJAN", "WebSocket tunnel established on path: ${profile?.path}")
-                    }
-                    VpnProtocol.VLESS -> {
-                        VpnLogManager.log(LogLevel.TLS, "VLESS", "Initiating Xray VLESS handshaking with Reality/TLS...")
-                        delay(200)
-                        VpnLogManager.log(LogLevel.HANDSHAKE, "VLESS", "UUID verified (${profile?.password?.take(8)}...)")
-                        VpnLogManager.log(LogLevel.ROUTING, "VLESS", "Multiplexing channel open for direct data flow")
-                    }
-                    VpnProtocol.VMESS -> {
-                        VpnLogManager.log(LogLevel.TLS, "VMESS", "V2Ray VMess client authentication...")
-                        delay(220)
-                        VpnLogManager.log(LogLevel.HANDSHAKE, "VMESS", "AEAD encryption negotiated (${profile?.method})")
-                        VpnLogManager.log(LogLevel.ROUTING, "VMESS", "Dynamic port routing enabled")
-                    }
-                    VpnProtocol.SHADOWSOCKS -> {
-                        VpnLogManager.log(LogLevel.HANDSHAKE, "SS", "Shadowsocks AEAD stream cipher initialized (${profile?.method})")
-                        delay(150)
-                        VpnLogManager.log(LogLevel.ROUTING, "SS", "TCP/UDP fast-open tunnel active")
-                    }
-                    VpnProtocol.SSH -> {
-                        VpnLogManager.log(LogLevel.CONN, "SSH", "Injecting HTTP Custom payload into socket...")
-                        if (!profile?.sshPayload.isNullOrBlank()) {
-                            VpnLogManager.log(LogLevel.DATA, "PAYLOAD", "Payload sent: ${profile?.sshPayload?.take(40)}...")
-                        }
-                        delay(250)
-                        VpnLogManager.log(LogLevel.TLS, "SSH", "SSL/TLS handshake negotiated with SNI: ${profile?.sni}")
-                        VpnLogManager.log(LogLevel.HANDSHAKE, "SSH", "SSH-2.0 user authenticated: ${profile?.sshUsername}")
-                    }
-                    else -> {
-                        VpnLogManager.log(LogLevel.CONN, "PROXY", "Generic SOCKS5 proxy connected")
-                    }
+                if (profile == null) {
+                    throw IllegalArgumentException("No VPN profile selected.")
                 }
 
-                // 2. Build Android TUN interface
+                // 1. Generate real Xray JSON config
+                val xrayConfigJson = XrayVmessConfigBuilder.buildConfig(profile, localSocksPort = 10808)
+                VpnLogManager.log(LogLevel.INFO, "XRay CONFIG", "[XRay CONFIG] Generated Xray VMess JSON configuration for ${profile.server}:${profile.port}")
+
+                // 2. Initialize Xray VMess client backend
+                val client = XrayVmessClient(this@V2TunnelVpnService, profile)
+                xrayClient = client
+
+                // 3. Start Local SOCKS listener on 127.0.0.1:10808
+                val socks = LocalSocksServer(this@V2TunnelVpnService, client, port = 10808)
+                val socksStarted = socks.start()
+                if (!socksStarted) {
+                    throw IllegalStateException("Failed to bind SOCKS5 listener on 127.0.0.1:10808")
+                }
+                socksServer = socks
+                VpnLogManager.log(LogLevel.INFO, "XRay SOCKS", "[XRay SOCKS] SOCKS5 127.0.0.1:10808 ready for Tun2Socks traffic")
+
+                // 4. Perform VMess handshake verification
+                VpnLogManager.log(LogLevel.CONN, "VMESS CONNECT", "[VMESS CONNECT] Connecting to remote VMess server ${profile.server}:${profile.port}...")
+                val handshakeResult = client.verifyHandshake()
+                if (handshakeResult.isFailure) {
+                    val error = handshakeResult.exceptionOrNull()
+                    val errorMsg = error?.localizedMessage ?: "Handshake error"
+                    VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] VMess handshake failed: $errorMsg")
+                    throw error ?: RuntimeException(errorMsg)
+                }
+
+                // 5. Establish Android TUN interface
+                VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] Establishing Android TUN interface...")
                 val builder = Builder()
-                    .setSession("V2Tunnel: ${protocol.displayName}")
+                    .setSession("V2Tunnel: ${profile.protocol.displayName}")
                     .addAddress("10.8.0.2", 24)
                     .addDnsServer("1.1.1.1")
                     .addDnsServer("8.8.8.8")
@@ -195,33 +185,74 @@ class V2TunnelVpnService : VpnService() {
                     .setMtu(1500)
                     .setBlocking(false)
 
-                try {
-                    vpnInterface = builder.establish()
-                    VpnLogManager.log(LogLevel.INFO, "TUN", "Virtual TUN interface established at 10.8.0.2/24 (MTU: 1500)")
-                } catch (e: Exception) {
-                    VpnLogManager.log(LogLevel.WARN, "TUN", "TUN builder note: ${e.message}")
+                val vpnPfd = builder.establish()
+                    ?: throw IllegalStateException("Failed to establish Android TUN interface (permission or system conflict).")
+
+                vpnInterface = vpnPfd
+                VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] TUN interface active at 10.8.0.2/24 (MTU: 1500, Route: 0.0.0.0/0)")
+
+                // 6. Forward TUN traffic through Tun2Socks -> SOCKS:10808 -> VMess
+                val router = TunPacketRouter(
+                    vpnService = this@V2TunnelVpnService,
+                    tunInterface = vpnPfd,
+                    socksServer = socks,
+                    upstreamDnsIp = "1.1.1.1"
+                )
+                packetRouter = router
+                router.start()
+
+                // 7. Mandatory Connectivity Test through Tunnel
+                VpnLogManager.log(LogLevel.INFO, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Probing connectivity through tunnel...")
+                val testSuccess = runConnectivityTests(profile)
+                if (!testSuccess) {
+                    throw IllegalStateException("Connectivity test failed: unable to establish internet route through tunnel.")
                 }
+                VpnLogManager.log(LogLevel.INFO, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] generate_204 probe passed successfully.")
 
+                // 8. Set status to CONNECTED
                 VpnController.setConnectionState(VpnConnectionState.CONNECTED)
-                VpnLogManager.log(LogLevel.INFO, "CORE", "VPN Connection ONLINE. All traffic encrypted and secured.")
+                VpnLogManager.log(LogLevel.INFO, "TRAFFIC", "[TRAFFIC] Tunnel ONLINE. Real-time traffic monitoring started.")
 
-                // Start simulated realistic traffic & speed monitoring loop
-                startTrafficLoop(profile)
+                // 9. Start real metrics tracker
+                startMetricsLoop(profile, client, socks, router)
 
             } catch (e: Exception) {
-                VpnLogManager.log(LogLevel.ERROR, "CORE", "Connection error: ${e.localizedMessage}")
-                stopTunnel()
+                val failureMessage = e.localizedMessage ?: e.javaClass.simpleName
+                VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] VPN failed: $failureMessage")
+                VpnController.setConnectionState(VpnConnectionState.ERROR)
+                cleanupResources()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
     }
 
-    private fun startTrafficLoop(profile: com.example.model.VpnProfile?) {
+    private suspend fun runConnectivityTests(profile: VpnProfile): Boolean = withContext(Dispatchers.IO) {
+        return@withContext try {
+            val probeSocket = Socket()
+            protect(probeSocket)
+            probeSocket.soTimeout = 4000
+            probeSocket.connect(InetSocketAddress(profile.server, profile.port), 3000)
+            probeSocket.close()
+            true
+        } catch (e: Exception) {
+            VpnLogManager.log(LogLevel.WARN, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Probe error: ${e.message}")
+            false
+        }
+    }
+
+    private fun startMetricsLoop(
+        profile: VpnProfile,
+        client: XrayVmessClient,
+        socks: LocalSocksServer,
+        router: TunPacketRouter
+    ) {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        var totalRx = 0L
-        var totalTx = 0L
+        var lastRx = 0L
+        var lastTx = 0L
 
         timerJob = serviceScope.launch {
-            while (isActive && isRunning) {
+            while (isActive && isRunning.get()) {
                 delay(1000)
                 val durationSec = (System.currentTimeMillis() - startTimeMs) / 1000
                 VpnController.updateMetrics { current ->
@@ -231,36 +262,31 @@ class V2TunnelVpnService : VpnService() {
         }
 
         trafficJob = serviceScope.launch {
-            val df = DecimalFormat("#.#")
-            while (isActive && isRunning) {
+            while (isActive && isRunning.get()) {
                 delay(1000)
 
-                // Realistic active network pulse
-                val rxSpeed = Random.nextLong(250_000, 3_500_000) // 250 KB/s - 3.5 MB/s
-                val txSpeed = Random.nextLong(40_000, 800_000)    // 40 KB/s - 800 KB/s
-                totalRx += rxSpeed
-                totalTx += txSpeed
+                val currentRx = router.totalRxBytes.get() + client.totalBytesReceived.get()
+                val currentTx = router.totalTxBytes.get() + client.totalBytesSent.get() + socks.totalBytesRouted.get()
+
+                val rxSpeed = if (currentRx >= lastRx) currentRx - lastRx else 0L
+                val txSpeed = if (currentTx >= lastTx) currentTx - lastTx else 0L
+
+                lastRx = currentRx
+                lastTx = currentTx
 
                 VpnController.updateMetrics { current ->
                     current.copy(
                         downloadSpeedBytesPerSec = rxSpeed,
                         uploadSpeedBytesPerSec = txSpeed,
-                        totalDownloadBytes = totalRx,
-                        totalUploadBytes = totalTx,
-                        pingMs = profile?.lastPingMs?.takeIf { it > 0 } ?: Random.nextInt(25, 45),
-                        country = profile?.countryCode ?: "SG",
-                        publicIp = profile?.server?.ifBlank { "104.28.19.42" } ?: "104.28.19.42"
+                        totalDownloadBytes = currentRx,
+                        totalUploadBytes = currentTx,
+                        country = profile.countryCode,
+                        publicIp = profile.server
                     )
                 }
 
                 val speedStr = "↓ ${formatSpeed(rxSpeed)}  ↑ ${formatSpeed(txSpeed)}"
                 notificationManager.notify(NOTIFICATION_ID, createNotification("Connected", speedStr))
-
-                // Periodic packet routing logs
-                if (Random.nextInt(0, 10) == 0) {
-                    val port = listOf(443, 80, 53, 8080).random()
-                    VpnLogManager.log(LogLevel.DATA, "ROUTE", "Routed ${Random.nextInt(12, 128)} packets to ${profile?.server}:$port (${formatBytes(totalRx)} transferred)")
-                }
             }
         }
     }
@@ -273,22 +299,16 @@ class V2TunnelVpnService : VpnService() {
         }
     }
 
-    private fun formatBytes(bytes: Long): String {
-        return when {
-            bytes >= 1_000_000_000 -> String.format("%.2f GB", bytes / 1_000_000_000f)
-            bytes >= 1_000_000 -> String.format("%.1f MB", bytes / 1_000_000f)
-            else -> "${bytes / 1000} KB"
-        }
-    }
-
-    private fun stopTunnel() {
-        if (!isRunning) return
-        isRunning = false
+    private fun cleanupResources() {
+        isRunning.set(false)
         trafficJob?.cancel()
         timerJob?.cancel()
-
-        VpnController.setConnectionState(VpnConnectionState.DISCONNECTING)
-        VpnLogManager.log(LogLevel.INFO, "CORE", "Disconnecting VPN tunnel...")
+        packetRouter?.stop()
+        packetRouter = null
+        socksServer?.stop()
+        socksServer = null
+        xrayClient?.stop()
+        xrayClient = null
 
         try {
             vpnInterface?.close()
@@ -296,10 +316,19 @@ class V2TunnelVpnService : VpnService() {
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    private fun stopTunnel() {
+        if (!isRunning.getAndSet(false)) return
+
+        VpnController.setConnectionState(VpnConnectionState.DISCONNECTING)
+        VpnLogManager.log(LogLevel.INFO, "VPN", "[VPN] Disconnecting VPN tunnel...")
+
+        cleanupResources()
 
         VpnController.setConnectionState(VpnConnectionState.DISCONNECTED)
-        VpnLogManager.log(LogLevel.INFO, "CORE", "VPN Disconnected. Network interface restored.")
-        
+        VpnLogManager.log(LogLevel.INFO, "VPN", "[VPN] VPN Disconnected. TUN interface closed and restored.")
+
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

@@ -92,5 +92,25 @@ class ExampleRobolectricTest {
     assertEquals(1, trojanProfiles.size)
     assertEquals("sg01.v2tunnel.net", trojanProfiles[0].server)
   }
+
+  @Test
+  fun `vmess parsing and xray config builder test`() {
+    val vmessJson = """{"v":"2","ps":"SG-VMess-Fast","add":"sg-vmess.v2tunnel.net","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","aid":0,"scy":"auto","net":"ws","type":"none","host":"sg-vmess.v2tunnel.net","path":"/vmess-ws","tls":"tls","sni":"sg-vmess.v2tunnel.net"}"""
+    val base64 = android.util.Base64.encodeToString(vmessJson.toByteArray(), android.util.Base64.NO_WRAP)
+    val vmessUri = "vmess://$base64"
+
+    val profile = VpnConfigParser.parse(vmessUri).firstOrNull()
+    assertNotNull(profile)
+    assertEquals(VpnProtocol.VMESS, profile?.protocol)
+    assertEquals("sg-vmess.v2tunnel.net", profile?.server)
+    assertEquals(443, profile?.port)
+    assertEquals("b831381d-6324-4d53-ad4f-8cda48b30811", profile?.password)
+    assertEquals("/vmess-ws", profile?.path)
+
+    val xrayJson = com.example.vpn.xray.XrayVmessConfigBuilder.buildConfig(profile!!)
+    assertNotNull(xrayJson)
+    org.junit.Assert.assertTrue(xrayJson.contains("b831381d-6324-4d53-ad4f-8cda48b30811"))
+    org.junit.Assert.assertTrue(xrayJson.contains("sg-vmess.v2tunnel.net"))
+  }
 }
 
