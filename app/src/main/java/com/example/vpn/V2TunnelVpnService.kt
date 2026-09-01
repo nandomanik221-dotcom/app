@@ -14,9 +14,11 @@ import com.example.MainActivity
 import com.example.model.LogLevel
 import com.example.model.VpnConnectionState
 import com.example.model.VpnProfile
+import com.example.model.VpnProtocol
+import com.example.vpn.backend.ITunnelBackend
+import com.example.vpn.backend.VpnBackendDispatcher
 import com.example.vpn.socks.LocalSocksServer
 import com.example.vpn.tun2socks.TunPacketRouter
-import com.example.vpn.xray.XrayVmessClient
 import com.example.vpn.xray.XrayVmessConfigBuilder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,7 +41,7 @@ class V2TunnelVpnService : VpnService() {
     private val isRunning = AtomicBoolean(false)
     private var startTimeMs = 0L
 
-    private var xrayClient: XrayVmessClient? = null
+    private var activeBackend: ITunnelBackend? = null
     private var socksServer: LocalSocksServer? = null
     private var packetRouter: TunPacketRouter? = null
 
@@ -181,35 +183,34 @@ class V2TunnelVpnService : VpnService() {
         startTimeMs = System.currentTimeMillis()
 
         VpnController.setConnectionState(VpnConnectionState.CONNECTING)
-        VpnLogManager.log(LogLevel.INFO, "XRay START", "[XRay START] Initializing Xray-core backend engine...")
-
         startForeground(NOTIFICATION_ID, createNotification("Connecting to ${profile.name}..."))
 
         return try {
-            // 1. Generate real Xray JSON config
-            val xrayConfigJson = XrayVmessConfigBuilder.buildConfig(profile, localSocksPort = 10808)
-            VpnLogManager.log(LogLevel.INFO, "XRay CONFIG", "[XRay CONFIG] Generated Xray VMess JSON configuration for ${profile.server}:${profile.port}")
+            // 1. If VMess protocol, build Xray JSON configuration
+            if (profile.protocol == VpnProtocol.VMESS) {
+                val xrayConfigJson = XrayVmessConfigBuilder.buildConfig(profile, localSocksPort = 10808)
+                VpnLogManager.log(LogLevel.INFO, "XRay CONFIG", "[XRay CONFIG] Generated Xray VMess JSON configuration for ${profile.server}:${profile.port}")
+            }
 
-            // 2. Initialize Xray VMess client backend
-            val client = XrayVmessClient(this@V2TunnelVpnService, profile)
-            xrayClient = client
+            // 2. Dispatch to the dedicated protocol backend (SSH, VMess, VLESS, Trojan, SS, SOCKS5)
+            val backend = VpnBackendDispatcher.dispatch(this@V2TunnelVpnService, profile)
+            activeBackend = backend
 
-            // 3. Start Local SOCKS listener on 127.0.0.1:10808
-            val socks = LocalSocksServer(this@V2TunnelVpnService, client, port = 10808)
+            // 3. Start Local SOCKS listener on 127.0.0.1:10808 with active backend
+            val socks = LocalSocksServer(this@V2TunnelVpnService, backend, port = 10808)
             val socksStarted = socks.start()
             if (!socksStarted) {
                 throw IllegalStateException("Failed to bind SOCKS5 listener on 127.0.0.1:10808")
             }
             socksServer = socks
-            VpnLogManager.log(LogLevel.INFO, "XRay SOCKS", "[XRay SOCKS] SOCKS5 127.0.0.1:10808 ready for Tun2Socks traffic")
+            VpnLogManager.log(LogLevel.INFO, "SOCKS5", "[SOCKS5] 127.0.0.1:10808 ready for Tun2Socks traffic")
 
-            // 4. Perform VMess handshake verification
-            VpnLogManager.log(LogLevel.CONN, "VMESS CONNECT", "[VMESS CONNECT] Connecting to remote VMess server ${profile.server}:${profile.port}...")
-            val handshakeResult = client.verifyHandshake()
+            // 4. Perform protocol-specific handshake verification
+            val handshakeResult = backend.verifyHandshake()
             if (handshakeResult.isFailure) {
                 val error = handshakeResult.exceptionOrNull()
                 val errorMsg = error?.localizedMessage ?: "Handshake error"
-                VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] VMess handshake failed: $errorMsg")
+                VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] ${backend.backendName} handshake failed: $errorMsg")
                 throw error ?: RuntimeException(errorMsg)
             }
 
@@ -232,7 +233,7 @@ class V2TunnelVpnService : VpnService() {
             vpnInterface = vpnPfd
             VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] TUN interface active (MTU: 1500, IPv4: 10.8.0.2/24, IPv6: fd00::2/120)")
 
-            // 6. Forward TUN traffic through Tun2Socks -> SOCKS:10808 -> VMess
+            // 6. Forward TUN traffic through Tun2Socks -> SOCKS:10808 -> Backend
             val router = TunPacketRouter(
                 vpnService = this@V2TunnelVpnService,
                 tunInterface = vpnPfd,
@@ -255,7 +256,7 @@ class V2TunnelVpnService : VpnService() {
             VpnLogManager.log(LogLevel.INFO, "TRAFFIC", "[TRAFFIC] Tunnel ONLINE. Real-time traffic monitoring started.")
 
             // 9. Start real metrics tracker
-            startMetricsLoop(profile, client, socks, router)
+            startMetricsLoop(profile, backend, socks, router)
             true
 
         } catch (e: Exception) {
@@ -281,7 +282,7 @@ class V2TunnelVpnService : VpnService() {
 
     private fun startMetricsLoop(
         profile: VpnProfile,
-        client: XrayVmessClient,
+        backend: ITunnelBackend,
         socks: LocalSocksServer,
         router: TunPacketRouter
     ) {
@@ -303,8 +304,8 @@ class V2TunnelVpnService : VpnService() {
             while (isActive && isRunning.get()) {
                 delay(1000)
 
-                val currentRx = router.totalRxBytes.get() + client.totalBytesReceived.get()
-                val currentTx = router.totalTxBytes.get() + client.totalBytesSent.get() + socks.totalBytesRouted.get()
+                val currentRx = router.totalRxBytes.get() + backend.totalBytesReceived.get()
+                val currentTx = router.totalTxBytes.get() + backend.totalBytesSent.get() + socks.totalBytesRouted.get()
 
                 val rxSpeed = if (currentRx >= lastRx) currentRx - lastRx else 0L
                 val txSpeed = if (currentTx >= lastTx) currentTx - lastTx else 0L
@@ -345,8 +346,8 @@ class V2TunnelVpnService : VpnService() {
         packetRouter = null
         socksServer?.stop()
         socksServer = null
-        xrayClient?.stop()
-        xrayClient = null
+        activeBackend?.stop()
+        activeBackend = null
 
         try {
             vpnInterface?.close()

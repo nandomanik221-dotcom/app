@@ -3,7 +3,7 @@ package com.example.vpn.socks
 import android.net.VpnService
 import com.example.model.LogLevel
 import com.example.vpn.VpnLogManager
-import com.example.vpn.xray.XrayVmessClient
+import com.example.vpn.backend.ITunnelBackend
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,11 +24,11 @@ import java.util.concurrent.atomic.AtomicLong
  * Production-ready local SOCKS5 Proxy Server (127.0.0.1:10808).
  * 
  * Intercepts SOCKS5 CONNECT requests from the Tun2Socks engine and bridges them
- * bidirectionally to the remote VMess / Xray outbound tunnel with protected sockets.
+ * bidirectionally to the active outbound protocol backend with protected sockets.
  */
 class LocalSocksServer(
     private val vpnService: VpnService,
-    private val vmessClient: XrayVmessClient,
+    private val backend: ITunnelBackend,
     val port: Int = 10808
 ) {
     private val isRunning = AtomicBoolean(false)
@@ -138,9 +138,9 @@ class LocalSocksServer(
             readFully(cIn, portBytes)
             val targetPort = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
 
-            // 3. Connect to remote destination via VMess client
+            // 3. Connect to remote destination via active protocol backend
             try {
-                remoteSocket = vmessClient.createTunnelSocket(targetHost, targetPort)
+                remoteSocket = backend.createTunnelSocket(targetHost, targetPort)
                 activeSockets.add(remoteSocket)
             } catch (e: Exception) {
                 cOut.write(byteArrayOf(0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0)) // Host unreachable

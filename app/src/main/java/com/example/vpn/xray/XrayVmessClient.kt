@@ -4,6 +4,8 @@ import android.net.VpnService
 import com.example.model.LogLevel
 import com.example.model.VpnProfile
 import com.example.vpn.VpnLogManager
+import com.example.vpn.backend.ITunnelBackend
+import com.example.vpn.util.SniUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
@@ -29,7 +31,7 @@ import javax.net.ssl.SSLSocketFactory
  * 
  * Establishes real outbound VMess connection:
  * 1. Protected TCP Socket
- * 2. TLS Handshake with SNI
+ * 2. TLS Handshake with sanitized SNI
  * 3. WebSocket Upgrade Handshake (101 Switching Protocols)
  * 4. VMess Authentication & Command Header
  * 5. Bidirectional Stream Tunneling
@@ -37,9 +39,11 @@ import javax.net.ssl.SSLSocketFactory
 class XrayVmessClient(
     private val vpnService: VpnService,
     private val profile: VpnProfile
-) {
-    val totalBytesSent = AtomicLong(0)
-    val totalBytesReceived = AtomicLong(0)
+) : ITunnelBackend {
+
+    override val backendName: String = "XrayVmessClient"
+    override val totalBytesSent = AtomicLong(0)
+    override val totalBytesReceived = AtomicLong(0)
     private val isRunning = AtomicBoolean(false)
 
     private var outboundSocket: Socket? = null
@@ -50,7 +54,7 @@ class XrayVmessClient(
     /**
      * Verifies the complete outbound handshake against the remote VMess server.
      */
-    suspend fun verifyHandshake(): Result<Boolean> = withContext(Dispatchers.IO) {
+    override suspend fun verifyHandshake(): Result<Unit> = withContext(Dispatchers.IO) {
         return@withContext try {
             val serverHost = profile.server
             val serverPort = profile.port
@@ -72,17 +76,20 @@ class XrayVmessClient(
 
             // 2. TLS Handshake if enabled
             if (profile.isTls) {
-                val sniHost = profile.sni.ifBlank { profile.wsHost.ifBlank { serverHost } }
+                val rawSni = profile.sni.ifBlank { profile.wsHost.ifBlank { serverHost } }
+                val sniHost = SniUtils.sanitizeSni(rawSni, serverHost)
                 VpnLogManager.log(LogLevel.CONN, "VMESS TLS", "[VMESS TLS] Initiating TLS handshake with SNI: $sniHost")
 
                 val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
                 val sslSocket = sslFactory.createSocket(rawSocket, serverHost, serverPort, true) as SSLSocket
                 vpnService.protect(sslSocket)
 
-                val sslParams = SSLParameters().apply {
-                    serverNames = listOf(SNIHostName(sniHost))
+                if (sniHost.isNotBlank()) {
+                    val sslParams = SSLParameters().apply {
+                        serverNames = listOf(SNIHostName(sniHost))
+                    }
+                    sslSocket.sslParameters = sslParams
                 }
-                sslSocket.sslParameters = sslParams
                 sslSocket.startHandshake()
                 targetSocket = sslSocket
                 VpnLogManager.log(LogLevel.CONN, "VMESS TLS", "[VMESS TLS] TLS handshake established successfully (Cipher: ${sslSocket.session.cipherSuite})")
@@ -90,7 +97,8 @@ class XrayVmessClient(
 
             // 3. WebSocket Upgrade if network == "ws"
             if (profile.network.equals("ws", ignoreCase = true)) {
-                val wsHost = profile.wsHost.ifBlank { profile.sni.ifBlank { serverHost } }
+                val rawWsHost = profile.wsHost.ifBlank { profile.sni.ifBlank { serverHost } }
+                val wsHost = SniUtils.sanitizeSni(rawWsHost, serverHost)
                 val wsPath = if (profile.wsPath.startsWith("/")) profile.wsPath else "/${profile.wsPath}"
 
                 VpnLogManager.log(LogLevel.CONN, "VMESS WS", "[VMESS WS] Sending WebSocket upgrade GET $wsPath HTTP/1.1 (Host: $wsHost)")
@@ -146,7 +154,7 @@ class XrayVmessClient(
             isTunnelReady.set(true)
 
             VpnLogManager.log(LogLevel.INFO, "VMESS READY", "[VMESS READY] Outbound VMess engine fully authenticated and ready for traffic.")
-            Result.success(true)
+            Result.success(Unit)
 
         } catch (e: Exception) {
             val errorMsg = e.localizedMessage ?: e.javaClass.simpleName
@@ -159,7 +167,7 @@ class XrayVmessClient(
     /**
      * Tunnels a single SOCKS5 connection to the remote target through the active VMess connection.
      */
-    fun createTunnelSocket(targetHost: String, targetPort: Int): Socket {
+    override fun createTunnelSocket(targetHost: String, targetPort: Int): Socket {
         val serverHost = profile.server
         val serverPort = profile.port
 
@@ -172,21 +180,25 @@ class XrayVmessClient(
         var targetSocket: Socket = rawSocket
 
         if (profile.isTls) {
-            val sniHost = profile.sni.ifBlank { profile.wsHost.ifBlank { serverHost } }
+            val rawSni = profile.sni.ifBlank { profile.wsHost.ifBlank { serverHost } }
+            val sniHost = SniUtils.sanitizeSni(rawSni, serverHost)
             val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
             val sslSocket = sslFactory.createSocket(rawSocket, serverHost, serverPort, true) as SSLSocket
             vpnService.protect(sslSocket)
 
-            val sslParams = SSLParameters().apply {
-                serverNames = listOf(SNIHostName(sniHost))
+            if (sniHost.isNotBlank()) {
+                val sslParams = SSLParameters().apply {
+                    serverNames = listOf(SNIHostName(sniHost))
+                }
+                sslSocket.sslParameters = sslParams
             }
-            sslSocket.sslParameters = sslParams
             sslSocket.startHandshake()
             targetSocket = sslSocket
         }
 
         if (profile.network.equals("ws", ignoreCase = true)) {
-            val wsHost = profile.wsHost.ifBlank { profile.sni.ifBlank { serverHost } }
+            val rawWsHost = profile.wsHost.ifBlank { profile.sni.ifBlank { serverHost } }
+            val wsHost = SniUtils.sanitizeSni(rawWsHost, serverHost)
             val wsPath = if (profile.wsPath.startsWith("/")) profile.wsPath else "/${profile.wsPath}"
 
             val output = targetSocket.getOutputStream()
@@ -336,7 +348,7 @@ class XrayVmessClient(
         }
     }
 
-    fun stop() {
+    override fun stop() {
         isRunning.set(false)
         isTunnelReady.set(false)
         try {

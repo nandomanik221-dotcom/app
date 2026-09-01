@@ -126,7 +126,8 @@ object VpnConfigParser {
             val type = json.optString("type", "none")
             val httpHost = json.optString("host", "")
             val path = json.optString("path", "/ws")
-            val tls = json.optString("tls", "tls")
+            val tls = json.optString("tls", "")
+            val isTlsConfig = tls.equals("tls", ignoreCase = true)
             val sni = json.optString("sni", if (httpHost.isNotBlank()) httpHost else host)
 
             if (host.isBlank() || id.isBlank()) return null
@@ -139,7 +140,7 @@ object VpnConfigParser {
                 password = id,
                 method = scy,
                 network = net,
-                security = if (tls.equals("tls", ignoreCase = true)) "tls" else "none",
+                security = if (isTlsConfig) "tls" else "none",
                 sni = sni,
                 path = path,
                 host = httpHost,
@@ -231,6 +232,8 @@ object VpnConfigParser {
             val remark = uri.fragment?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: "SSH Tunnel"
             val sni = uri.getQueryParameter("sni") ?: ""
             val payload = uri.getQueryParameter("payload")?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: ""
+            val sslParam = uri.getQueryParameter("ssl")
+            val isSsl = sslParam?.toBooleanStrictOrNull() ?: (port == 443 || sni.isNotBlank())
 
             VpnProfile(
                 name = remark,
@@ -239,8 +242,12 @@ object VpnConfigParser {
                 port = port,
                 username = username,
                 password = password,
+                sshUsername = username,
+                sshPassword = password,
                 sni = sni,
                 sshPayload = payload,
+                sshDirectSsl = isSsl,
+                security = if (isSsl) "tls" else "none",
                 countryCode = detectCountry(remark, host),
                 rawUri = uriString
             )
