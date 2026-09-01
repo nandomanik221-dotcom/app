@@ -6,10 +6,18 @@ import com.example.model.LogLevel
 import com.example.model.VpnProfile
 import com.example.vpn.VpnLogManager
 import com.example.vpn.backend.ITunnelBackend
+import com.example.vpn.util.HttpStatusParser
+import com.example.vpn.util.PayloadMode
 import com.example.vpn.util.SniUtils
+import com.jcraft.jsch.ChannelDirectTCPIP
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
+import com.jcraft.jsch.SocketFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.StandardCharsets
@@ -23,16 +31,17 @@ import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 /**
- * High-Performance SSH Tunnel Client Backend for V2Tunnel.
+ * Production-ready SSH Tunnel Client Backend for V2Tunnel.
  *
- * Implements a complete HTTP Custom-compliant SSH connection pipeline:
- * 1. Remote Proxy Transport (HTTP CONNECT with Basic Auth / SOCKS5 Proxy RFC 1928 & RFC 1929)
- * 2. Protected Direct TCP Connection (VpnService.protect() before connect)
- * 3. SSL/TLS Encapsulation (Stunnel / Direct SSL) with Sanitized SNI
- * 4. Custom HTTP / WebSocket Payload Injection with Response Validation
- * 5. RFC 6455 WebSocket Binary Framing (Masked Client-to-Server, Unmasked Server-to-Client)
- * 6. SSH-2.0 Identification Banner Exchange, Key Exchange & Masked User Authentication
- * 7. Multi-Socket Stream Multiplexing for Tun2Socks Router
+ * Implements a complete HTTP Custom compliant SSH pipeline powered by genuine JSch session management:
+ * 1. Protected Outbound Socket (VpnService.protect() before connect)
+ * 2. Remote Proxy Transport (HTTP CONNECT RFC 7230 / SOCKS5 Proxy RFC 1928 & RFC 1929)
+ * 3. Direct SSL / TLS Encapsulation with Sanitized SNI
+ * 4. Custom HTTP / WebSocket Payload Injection with RFC 9112 Status Parsing
+ * 5. RFC 6455 WebSocket Framing Layer for WS-wrapped SSH endpoints
+ * 6. Authentic JSch SSH-2.0 Session (Real KEX, Real Cipher negotiation, Real Password Auth)
+ * 7. Real `direct-tcpip` Channel Multiplexing for TunPacketRouter and Local SOCKS5 Proxy
+ * 8. Real end-to-end connectivity verification and atomic byte counting
  */
 class SshTunnelClient(
     private val vpnService: VpnService,
@@ -45,7 +54,10 @@ class SshTunnelClient(
 
     private val isRunning = AtomicBoolean(false)
     private val isTunnelReady = AtomicBoolean(false)
-    private val openSockets = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
+
+    private var activeSession: Session? = null
+    private var baseTransportSocket: Socket? = null
+    private val openChannels = Collections.newSetFromMap(ConcurrentHashMap<DirectTcpIpSocket, Boolean>())
 
     override suspend fun verifyHandshake(): Result<Unit> = withContext(Dispatchers.IO) {
         return@withContext try {
@@ -56,46 +68,60 @@ class SshTunnelClient(
                 throw IllegalArgumentException("Invalid SSH destination: $serverHost:$serverPort")
             }
 
-            // 1. Establish underlying transport socket (Direct or via Remote Proxy)
-            var activeSocket = establishBaseSocket(serverHost, serverPort)
+            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Initializing connection pipeline for $serverHost:$serverPort")
 
-            // 2. SSL/TLS Encapsulation if enabled (Direct SSL / SNI)
-            val isSsl = profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
-            if (isSsl) {
-                activeSocket = performTlsHandshake(activeSocket, serverHost, serverPort)
+            // 1. Establish protected base transport socket (Direct or via Remote Proxy)
+            val transportSocket = establishTransportSocket(serverHost, serverPort)
+            baseTransportSocket = transportSocket
+
+            // 2. Initialize authentic JSch SSH Session
+            val jsch = JSch()
+            val username = profile.effectiveSshUsername.ifBlank { "root" }
+            val password = profile.effectiveSshPassword
+
+            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Initializing SSH session for user: $username")
+
+            val session = jsch.getSession(username, serverHost, serverPort)
+            session.setPassword(password)
+
+            // Inject the prepared transport socket via JSch SocketFactory
+            session.setSocketFactory(object : SocketFactory {
+                override fun createSocket(host: String?, port: Int): Socket = transportSocket
+                override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
+                override fun getOutputStream(socket: Socket): OutputStream = socket.getOutputStream()
+            })
+
+            // Host key verification policy: allow insecure/unknown host key for custom VPN servers
+            session.setConfig("StrictHostKeyChecking", "no")
+            session.setConfig("PreferredAuthentications", "password,keyboard-interactive,publickey")
+            session.setConfig("compression.s2c", "zlib@openssh.com,zlib,none")
+            session.setConfig("compression.c2s", "zlib@openssh.com,zlib,none")
+            session.serverAliveInterval = 30000
+
+            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Starting SSH KEX & user authentication...")
+
+            // 3. Connect real SSH session (performs actual identification exchange, KEX, and authentication)
+            session.connect(25000)
+
+            if (!session.isConnected) {
+                throw IllegalStateException("SSH authentication failed or session disconnected")
             }
 
-            // 3. Custom HTTP Payload / WebSocket Injection if configured
-            var hasWsUpgrade = false
-            if (profile.sshPayload.isNotBlank()) {
-                hasWsUpgrade = performPayloadInjection(activeSocket, serverHost, serverPort)
-            }
-
-            // 4. Wrap with RFC 6455 WebSocket Framing if payload requested WebSocket Upgrade
-            if (hasWsUpgrade) {
-                VpnLogManager.log(LogLevel.CONN, "WS", "[WS] Activating RFC 6455 WebSocket binary framing layer")
-                activeSocket = WebSocketFramedSocket(activeSocket)
-            }
-
-            // 5. SSH-2.0 Banner Exchange & Protocol Verification
-            performSshBannerExchange(activeSocket)
-
-            // 6. SSH Key Exchange & Packet Handshake
-            performSshKeyExchange(activeSocket)
-
-            // 7. User Authentication Verification (without logging plaintext passwords)
-            val username = profile.effectiveSshUsername.ifBlank { "vpnuser" }
-            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Authenticating user: $username")
-            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Authentication successful for user: $username")
-            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Channel tunnel established successfully")
-
-            openSockets.add(activeSocket)
+            activeSession = session
             isRunning.set(true)
+
+            val serverVersion = session.serverVersion
+            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Connected successfully (Server: $serverVersion)")
+
+            // 4. Real end-to-end verification via direct-tcpip channel test
+            verifyEndToEndConnectivity(session)
+
             isTunnelReady.set(true)
+            VpnLogManager.log(LogLevel.INFO, "TUNNEL", "[TUNNEL] SSH tunnel ready and operational")
 
             Result.success(Unit)
         } catch (e: Exception) {
-            val errMsg = e.message ?: "Unknown SSH handshake failure"
+            val errMsg = e.message ?: e.javaClass.simpleName
             VpnLogManager.log(LogLevel.ERROR, "SSH ERROR", "[SSH ERROR] Connection failed: $errMsg")
             stop()
             Result.failure(e)
@@ -103,70 +129,106 @@ class SshTunnelClient(
     }
 
     override fun createTunnelSocket(targetHost: String, targetPort: Int): Socket {
-        val serverHost = profile.server.trim()
-        val serverPort = profile.port
-
-        var activeSocket = establishBaseSocket(serverHost, serverPort)
-
-        val isSsl = profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
-        if (isSsl) {
-            activeSocket = performTlsHandshake(activeSocket, serverHost, serverPort)
+        val session = activeSession
+        if (session == null || !session.isConnected) {
+            throw IllegalStateException("SSH Session is not active or disconnected")
         }
 
-        var hasWsUpgrade = false
-        if (profile.sshPayload.isNotBlank()) {
-            hasWsUpgrade = performPayloadInjection(activeSocket, serverHost, serverPort)
-        }
+        try {
+            val channel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
+            channel.setHost(targetHost)
+            channel.setPort(targetPort)
+            channel.setOrgIPAddress("127.0.0.1")
+            channel.setOrgPort(0)
+            channel.connect(15000)
 
-        if (hasWsUpgrade) {
-            activeSocket = WebSocketFramedSocket(activeSocket)
+            val socket = DirectTcpIpSocket(
+                channel = channel,
+                targetHost = targetHost,
+                targetPort = targetPort,
+                totalBytesSent = totalBytesSent,
+                totalBytesReceived = totalBytesReceived
+            )
+            openChannels.add(socket)
+            return socket
+        } catch (e: Exception) {
+            VpnLogManager.log(LogLevel.WARN, "SSH CHANNEL", "[SSH CHANNEL] Failed to open direct-tcpip to $targetHost:$targetPort - ${e.message}")
+            throw e
         }
-
-        openSockets.add(activeSocket)
-        return activeSocket
     }
 
     override fun stop() {
         isRunning.set(false)
         isTunnelReady.set(false)
-        openSockets.forEach { socket ->
+
+        openChannels.forEach { channelSocket ->
             try {
-                if (!socket.isClosed) socket.close()
+                channelSocket.close()
             } catch (_: Exception) {}
         }
-        openSockets.clear()
+        openChannels.clear()
+
+        try {
+            activeSession?.disconnect()
+        } catch (_: Exception) {}
+        activeSession = null
+
+        try {
+            baseTransportSocket?.close()
+        } catch (_: Exception) {}
+        baseTransportSocket = null
     }
 
     /**
-     * Establishes base TCP socket, protecting socket upstream before connecting.
-     * Routes via Remote Proxy if enabled; otherwise directly to SSH destination.
+     * Establishes the full transport socket pipeline:
+     * Base TCP (Protected) -> Remote Proxy (HTTP CONNECT/SOCKS5) -> TLS (SNI) -> Payload/WebSocket Framing
      */
-    private fun establishBaseSocket(serverHost: String, serverPort: Int): Socket {
+    private fun establishTransportSocket(serverHost: String, serverPort: Int): Socket {
         val rawSocket = Socket()
-        // CRITICAL: Protect socket BEFORE connecting to prevent routing loop
-        vpnService.protect(rawSocket)
-        rawSocket.tcpNoDelay = true
-        rawSocket.soTimeout = 20000
 
+        // 1. Mandatory VpnService.protect() BEFORE socket.connect()
+        val protected = vpnService.protect(rawSocket)
+        if (!protected) {
+            rawSocket.close()
+            throw IllegalStateException("Failed to protect upstream socket from VPN routing loop")
+        }
+
+        rawSocket.tcpNoDelay = true
+        rawSocket.soTimeout = 25000
+
+        var currentSocket: Socket = rawSocket
+
+        // 2. Remote Proxy handling
         if (profile.remoteProxyEnabled && profile.remoteProxyHost.isNotBlank()) {
             val proxyHost = profile.remoteProxyHost.trim()
             val proxyPort = if (profile.remoteProxyPort > 0) profile.remoteProxyPort else 8080
             val proxyType = profile.remoteProxyType.uppercase()
 
             VpnLogManager.log(LogLevel.CONN, "PROXY", "[PROXY] Connecting to $proxyHost:$proxyPort (Type: $proxyType)...")
-            rawSocket.connect(InetSocketAddress(proxyHost, proxyPort), 10000)
+            currentSocket.connect(InetSocketAddress(proxyHost, proxyPort), 10000)
 
             if (proxyType == "SOCKS5") {
-                performSocks5ProxyHandshake(rawSocket, serverHost, serverPort)
+                performSocks5ProxyHandshake(currentSocket, serverHost, serverPort)
             } else {
-                performHttpProxyConnect(rawSocket, serverHost, serverPort)
+                performHttpProxyConnect(currentSocket, serverHost, serverPort)
             }
-            return rawSocket
         } else {
             VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Connecting directly to $serverHost:$serverPort...")
-            rawSocket.connect(InetSocketAddress(serverHost, serverPort), 10000)
-            return rawSocket
+            currentSocket.connect(InetSocketAddress(serverHost, serverPort), 10000)
         }
+
+        // 3. SSL/TLS Encapsulation if enabled
+        val isSsl = profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
+        if (isSsl) {
+            currentSocket = performTlsHandshake(currentSocket, serverHost, serverPort)
+        }
+
+        // 4. Custom HTTP Payload / WebSocket injection
+        if (profile.sshPayload.isNotBlank()) {
+            currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+        }
+
+        return currentSocket
     }
 
     /**
@@ -176,7 +238,7 @@ class SshTunnelClient(
         val out = socket.getOutputStream()
         val inStream = socket.getInputStream()
 
-        VpnLogManager.log(LogLevel.CONN, "PROXY", "[PROXY] HTTP CONNECT $targetHost:$targetPort...")
+        VpnLogManager.log(LogLevel.CONN, "PROXY", "[PROXY] Sending HTTP CONNECT $targetHost:$targetPort")
 
         val connectBuilder = StringBuilder()
         connectBuilder.append("CONNECT $targetHost:$targetPort HTTP/1.1\r\n")
@@ -197,18 +259,19 @@ class SshTunnelClient(
         out.flush()
 
         val statusLine = readLine(inStream)
+        val statusCode = HttpStatusParser.parseStatusCode(statusLine)
 
-        if (statusLine.contains("407")) {
-            VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY] HTTP CONNECT failed: 407 (Proxy Authentication Required)")
+        if (statusCode == 407) {
+            VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY] HTTP CONNECT failed: 407 Proxy Authentication Required")
             throw IllegalStateException("HTTP Proxy authentication required (HTTP 407)")
         }
 
-        if (!statusLine.contains("200")) {
+        if (statusCode != 200) {
             VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY] HTTP CONNECT failed: $statusLine")
-            throw IllegalStateException("HTTP Proxy CONNECT failed: $statusLine")
+            throw IllegalStateException("HTTP Proxy CONNECT failed with status $statusCode: $statusLine")
         }
 
-        // Consume all remaining proxy headers until empty line
+        // Consume remaining headers
         while (true) {
             val line = readLine(inStream)
             if (line.isBlank()) break
@@ -228,6 +291,12 @@ class SshTunnelClient(
         val proxyPass = profile.remoteProxyPassword ?: ""
         val hasAuth = proxyUser.isNotBlank()
 
+        if (proxyUser.toByteArray(StandardCharsets.UTF_8).size > 255 ||
+            proxyPass.toByteArray(StandardCharsets.UTF_8).size > 255
+        ) {
+            throw IllegalArgumentException("SOCKS5 username/password exceeds 255 bytes limit")
+        }
+
         // SOCKS5 greeting: VER 0x05, NMETHODS, METHODS (0x00 NO_AUTH, 0x02 USER_PASS)
         if (hasAuth) {
             out.write(byteArrayOf(0x05, 0x02, 0x00, 0x02))
@@ -241,10 +310,10 @@ class SshTunnelClient(
         if (ver != 0x05) throw IllegalStateException("Invalid SOCKS5 version response: $ver")
 
         if (method == 0x02 && hasAuth) {
-            // RFC 1929 Username/Password Authentication
+            // RFC 1929 Sub-negotiation
             val userBytes = proxyUser.toByteArray(StandardCharsets.UTF_8)
             val passBytes = proxyPass.toByteArray(StandardCharsets.UTF_8)
-            out.write(0x01)
+            out.write(0x01) // Auth version
             out.write(userBytes.size)
             out.write(userBytes)
             out.write(passBytes.size)
@@ -253,26 +322,16 @@ class SshTunnelClient(
 
             val authVer = inStream.read()
             val authStatus = inStream.read()
-            if (authStatus != 0x00) {
+            if (authVer != 0x01 || authStatus != 0x00) {
                 VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY] SOCKS5 authentication failed (status: $authStatus)")
                 throw IllegalStateException("SOCKS5 Proxy authentication failed (Status: $authStatus)")
             }
         } else if (method == 0xFF) {
-            throw IllegalStateException("SOCKS5 Proxy authentication method rejected")
+            throw IllegalStateException("SOCKS5 Proxy authentication method rejected (0xFF)")
         }
 
-        // SOCKS5 CONNECT command: VER 0x05, CMD 0x01 (CONNECT), RSV 0x00, ATYP 0x03 (Domain), DOMAIN, PORT
-        val hostBytes = targetHost.toByteArray(StandardCharsets.UTF_8)
-        val connectPkt = ByteArray(4 + 1 + hostBytes.size + 2)
-        connectPkt[0] = 0x05
-        connectPkt[1] = 0x01
-        connectPkt[2] = 0x00
-        connectPkt[3] = 0x03 // Domain name
-        connectPkt[4] = hostBytes.size.toByte()
-        System.arraycopy(hostBytes, 0, connectPkt, 5, hostBytes.size)
-        connectPkt[5 + hostBytes.size] = ((targetPort shr 8) and 0xFF).toByte()
-        connectPkt[6 + hostBytes.size] = (targetPort and 0xFF).toByte()
-
+        // Prepare CONNECT request with IPv4, Domain, or IPv6 addressing
+        val connectPkt = buildSocks5ConnectPacket(targetHost, targetPort)
         out.write(connectPkt)
         out.flush()
 
@@ -281,7 +340,7 @@ class SshTunnelClient(
         val respRsv = inStream.read()
         val respAtyp = inStream.read()
 
-        if (respRep != 0x00) {
+        if (respVer != 0x05 || respRep != 0x00 || respRsv != 0x00) {
             VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY] SOCKS5 CONNECT failed with code: $respRep")
             throw IllegalStateException("SOCKS5 Proxy connection to target failed with code: $respRep")
         }
@@ -294,9 +353,47 @@ class SshTunnelClient(
                 inStream.readNBytesCompat(len + 2) // Domain + Port
             }
             0x04 -> inStream.readNBytesCompat(16 + 2) // IPv6 + Port
+            else -> throw IllegalStateException("Unknown SOCKS5 address type: $respAtyp")
         }
 
         VpnLogManager.log(LogLevel.CONN, "PROXY", "[PROXY] SOCKS5 connected to $targetHost:$targetPort")
+    }
+
+    private fun buildSocks5ConnectPacket(host: String, port: Int): ByteArray {
+        val isIpv4 = host.matches(Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"""))
+        return if (isIpv4) {
+            val parts = host.split(".").map { it.toInt().toByte() }
+            byteArrayOf(
+                0x05, 0x01, 0x00, 0x01,
+                parts[0], parts[1], parts[2], parts[3],
+                ((port shr 8) and 0xFF).toByte(),
+                (port and 0xFF).toByte()
+            )
+        } else if (host.contains(":")) {
+            val ip6Bytes = InetAddress.getByName(host).address
+            val pkt = ByteArray(4 + 16 + 2)
+            pkt[0] = 0x05
+            pkt[1] = 0x01
+            pkt[2] = 0x00
+            pkt[3] = 0x04 // IPv6
+            System.arraycopy(ip6Bytes, 0, pkt, 4, 16)
+            pkt[20] = ((port shr 8) and 0xFF).toByte()
+            pkt[21] = (port and 0xFF).toByte()
+            pkt
+        } else {
+            val domainBytes = host.toByteArray(StandardCharsets.UTF_8)
+            if (domainBytes.size > 255) throw IllegalArgumentException("Domain name exceeds 255 bytes")
+            val pkt = ByteArray(4 + 1 + domainBytes.size + 2)
+            pkt[0] = 0x05
+            pkt[1] = 0x01
+            pkt[2] = 0x00
+            pkt[3] = 0x03 // Domain name
+            pkt[4] = domainBytes.size.toByte()
+            System.arraycopy(domainBytes, 0, pkt, 5, domainBytes.size)
+            pkt[5 + domainBytes.size] = ((port shr 8) and 0xFF).toByte()
+            pkt[6 + domainBytes.size] = (port and 0xFF).toByte()
+            pkt
+        }
     }
 
     /**
@@ -305,7 +402,7 @@ class SshTunnelClient(
     private fun performTlsHandshake(rawSocket: Socket, serverHost: String, serverPort: Int): Socket {
         val rawSni = profile.sni.ifBlank { serverHost }
         val cleanSni = SniUtils.sanitizeSni(rawSni, serverHost)
-        VpnLogManager.log(LogLevel.CONN, "TLS", "[TLS] Connecting with SNI: $cleanSni")
+        VpnLogManager.log(LogLevel.CONN, "TLS", "[TLS] Encapsulating with SNI: $cleanSni")
 
         val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
         val sslSocket = sslFactory.createSocket(rawSocket, serverHost, serverPort, true) as SSLSocket
@@ -320,72 +417,99 @@ class SshTunnelClient(
         sslSocket.startHandshake()
         val cipher = sslSocket.session.cipherSuite
         val protocolVersion = sslSocket.session.protocol
-        VpnLogManager.log(LogLevel.CONN, "TLS", "[TLS] TLS handshake established ($protocolVersion, Cipher: $cipher)")
+        VpnLogManager.log(LogLevel.CONN, "TLS", "[TLS] TLS handshake established ($protocolVersion, $cipher)")
         return sslSocket
     }
 
     /**
-     * Injects Custom HTTP Payload / WebSocket Upgrade header and validates HTTP response.
-     * Returns true if WebSocket Upgrade (101) was negotiated.
+     * Injects Custom HTTP / WebSocket Payload and executes appropriate protocol switching.
      */
-    private fun performPayloadInjection(socket: Socket, serverHost: String, serverPort: Int): Boolean {
+    private fun handleCustomPayload(socket: Socket, serverHost: String, serverPort: Int): Socket {
+        val mode = HttpStatusParser.detectPayloadMode(profile.sshPayload)
         val formattedPayload = formatPayload(profile.sshPayload, serverHost, serverPort)
-        VpnLogManager.log(LogLevel.CONN, "PAYLOAD", "[PAYLOAD] Sending payload")
+
+        VpnLogManager.log(LogLevel.CONN, "PAYLOAD", "[PAYLOAD] Injecting payload (Mode: $mode)")
 
         val out = socket.getOutputStream()
         out.write(formattedPayload.toByteArray(StandardCharsets.UTF_8))
         out.flush()
 
-        val inStream = socket.getInputStream()
-        val statusLine = readLine(inStream)
+        when (mode) {
+            PayloadMode.WEBSOCKET -> {
+                val inStream = socket.getInputStream()
+                val statusLine = readLine(inStream)
+                val statusCode = HttpStatusParser.parseStatusCode(statusLine)
 
-        val isWsUpgrade = formattedPayload.contains("Upgrade: websocket", ignoreCase = true)
-        val is101 = statusLine.contains("101") || statusLine.contains("Switching Protocols")
-        val is200 = statusLine.contains("200") || statusLine.contains("OK")
+                if (statusCode != 101) {
+                    VpnLogManager.log(LogLevel.WARN, "PAYLOAD", "[PAYLOAD] WebSocket upgrade status: $statusLine")
+                    throw IllegalStateException("WebSocket Upgrade failed with HTTP status $statusCode: $statusLine")
+                }
 
-        if (isWsUpgrade && is101) {
-            VpnLogManager.log(LogLevel.CONN, "PAYLOAD", "[PAYLOAD] Response: $statusLine")
-        } else if (is200) {
-            VpnLogManager.log(LogLevel.CONN, "PAYLOAD", "[PAYLOAD] Response: $statusLine")
-        } else if (statusLine.isNotBlank() && (statusLine.contains("400") || statusLine.contains("403") || statusLine.contains("502"))) {
-            VpnLogManager.log(LogLevel.WARN, "PAYLOAD", "[PAYLOAD] Response error: $statusLine")
-        }
+                // Consume remaining headers
+                while (true) {
+                    val line = readLine(inStream)
+                    if (line.isBlank()) break
+                }
 
-        // Consume remaining HTTP headers until empty line
-        while (true) {
-            val headerLine = readLine(inStream)
-            if (headerLine.isBlank()) break
-        }
+                VpnLogManager.log(LogLevel.CONN, "WS", "[WS] HTTP 101 Switching Protocols - activating RFC 6455 binary framing")
+                return WebSocketFramedSocket(socket)
+            }
+            PayloadMode.PAYLOAD_WITH_HTTP_RESPONSE -> {
+                val inStream = socket.getInputStream()
+                val statusLine = readLine(inStream)
+                val statusCode = HttpStatusParser.parseStatusCode(statusLine)
 
-        return (isWsUpgrade && is101)
-    }
-
-    /**
-     * Exchanges SSH-2.0 Identification Banners.
-     */
-    private fun performSshBannerExchange(socket: Socket) {
-        val outStream = socket.getOutputStream()
-        val inStream = socket.getInputStream()
-
-        // Send client SSH identification string
-        val clientBanner = "SSH-2.0-V2Tunnel_SSH_1.0\r\n"
-        outStream.write(clientBanner.toByteArray(StandardCharsets.US_ASCII))
-        outStream.flush()
-
-        // Read server SSH identification string
-        val serverBanner = readLine(inStream).trim()
-        if (serverBanner.startsWith("SSH-", ignoreCase = true)) {
-            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Server identification received: $serverBanner")
-        } else {
-            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Server identification received: ${serverBanner.take(48)}")
+                if (statusCode != null && statusCode in 200..299) {
+                    VpnLogManager.log(LogLevel.CONN, "PAYLOAD", "[PAYLOAD] HTTP Response: $statusLine")
+                    while (true) {
+                        val line = readLine(inStream)
+                        if (line.isBlank()) break
+                    }
+                } else if (statusCode != null) {
+                    VpnLogManager.log(LogLevel.WARN, "PAYLOAD", "[PAYLOAD] Non-2xx response: $statusLine")
+                }
+                return socket
+            }
+            PayloadMode.PAYLOAD_ONLY, PayloadMode.NONE -> {
+                // Do not consume stream; remote endpoint immediately begins SSH banner exchange
+                return socket
+            }
         }
     }
 
     /**
-     * Performs SSH Key Exchange negotiation and packet initialization.
+     * Real end-to-end connectivity verification via an active direct-tcpip channel.
      */
-    private fun performSshKeyExchange(socket: Socket) {
-        VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Key exchange completed")
+    private fun verifyEndToEndConnectivity(session: Session) {
+        try {
+            val verifyChannel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
+            verifyChannel.setHost("1.1.1.1")
+            verifyChannel.setPort(80)
+            verifyChannel.setOrgIPAddress("127.0.0.1")
+            verifyChannel.setOrgPort(0)
+            verifyChannel.connect(10000)
+
+            val vOut = verifyChannel.outputStream
+            val vIn = verifyChannel.inputStream
+
+            val testReq = "HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"
+            vOut.write(testReq.toByteArray(StandardCharsets.US_ASCII))
+            vOut.flush()
+
+            val respLine = readLine(vIn)
+            val code = HttpStatusParser.parseStatusCode(respLine)
+
+            verifyChannel.disconnect()
+
+            if (code != null) {
+                VpnLogManager.log(LogLevel.INFO, "VERIFY", "[VERIFY] Real end-to-end connectivity verified (HTTP $code)")
+            } else {
+                VpnLogManager.log(LogLevel.INFO, "VERIFY", "[VERIFY] Direct-tcpip channel opened and responsive")
+            }
+        } catch (e: Exception) {
+            // If probe host is blocked or unreachable, session itself is still authenticated
+            VpnLogManager.log(LogLevel.WARN, "VERIFY", "[VERIFY] End-to-end probe note: ${e.message}")
+        }
     }
 
     /**

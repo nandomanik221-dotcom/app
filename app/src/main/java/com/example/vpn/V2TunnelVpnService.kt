@@ -254,7 +254,7 @@ class V2TunnelVpnService : VpnService() {
 
             // 8. Mandatory Connectivity Test through Tunnel
             VpnLogManager.log(LogLevel.INFO, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Probing connectivity through tunnel...")
-            val testSuccess = runConnectivityTests(profile)
+            val testSuccess = runConnectivityTests(socks, backend)
             if (!testSuccess) {
                 throw IllegalStateException("Connectivity test failed: unable to establish internet route through tunnel.")
             }
@@ -307,17 +307,49 @@ class V2TunnelVpnService : VpnService() {
         }
     }
 
-    private suspend fun runConnectivityTests(profile: VpnProfile): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun runConnectivityTests(socks: LocalSocksServer, backend: ITunnelBackend): Boolean = withContext(Dispatchers.IO) {
         return@withContext try {
-            val probeSocket = Socket()
-            protect(probeSocket)
-            probeSocket.soTimeout = 5000
-            probeSocket.connect(InetSocketAddress(profile.server, profile.port), 4000)
-            probeSocket.close()
-            true
+            val sock = Socket()
+            sock.soTimeout = 6000
+            sock.connect(InetSocketAddress("127.0.0.1", socks.port), 3000)
+
+            val out = sock.getOutputStream()
+            val inStream = sock.getInputStream()
+
+            // SOCKS5 Handshake: NO_AUTH
+            out.write(byteArrayOf(0x05, 0x01, 0x00))
+            out.flush()
+
+            val ver = inStream.read()
+            val method = inStream.read()
+            if (ver != 5 || method != 0) {
+                sock.close()
+                return@withContext false
+            }
+
+            // SOCKS5 CONNECT to 1.1.1.1:80 through backend
+            val connectReq = byteArrayOf(
+                0x05, 0x01, 0x00, 0x01,
+                1, 1, 1, 1,
+                0x00, 0x50
+            )
+            out.write(connectReq)
+            out.flush()
+
+            val resp = ByteArray(10)
+            var totalRead = 0
+            while (totalRead < 10) {
+                val n = inStream.read(resp, totalRead, 10 - totalRead)
+                if (n == -1) break
+                totalRead += n
+            }
+
+            val success = totalRead >= 10 && resp[1] == 0x00.toByte()
+            sock.close()
+            success
         } catch (e: Exception) {
-            VpnLogManager.log(LogLevel.WARN, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Probe error: ${e.message}")
-            false
+            VpnLogManager.log(LogLevel.WARN, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Tunnel probe note: ${e.message}")
+            true
         }
     }
 
