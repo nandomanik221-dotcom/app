@@ -321,10 +321,10 @@ fun ToolsScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                InfoRow(label = "Virtual IP Address", value = if (isConnected) metrics.publicIp else "182.1.204.55 (Direct)")
-                InfoRow(label = "ISP / Autonomous System", value = if (isConnected) "Cloudflare / V2Tunnel Core" else "Telkomsel Indonesia")
-                InfoRow(label = "Country & City", value = if (isConnected) "${activeProfile?.countryCode ?: "SG"} • Singapore (Jurong)" else "ID • Jakarta, Indonesia")
-                InfoRow(label = "DNS Leak Protection", value = if (isConnected) "PROTECTED (Encrypted DoH)" else "EXPOSED (Standard ISP DNS)")
+                InfoRow(label = "Virtual IP Address", value = if (isConnected) metrics.publicIp.ifBlank { "-" } else "Disconnected (Direct)")
+                InfoRow(label = "ISP / Autonomous System", value = if (isConnected) "VPN Protected Route" else "Direct Provider")
+                InfoRow(label = "Country & City", value = if (isConnected) (activeProfile?.countryCode ?: "-") else "-")
+                InfoRow(label = "DNS Leak Protection", value = if (isConnected) "PROTECTED (Upstream 1.1.1.1)" else "DIRECT")
             }
         }
 

@@ -27,6 +27,18 @@ data class VpnProfile(
     val rawUri: String = "",
     val createdAt: Long = System.currentTimeMillis()
 ) {
+    val isTls: Boolean
+        get() = security.equals("tls", ignoreCase = true) || security.equals("reality", ignoreCase = true)
+
+    val wsHost: String
+        get() = host
+
+    val wsPath: String
+        get() = path
+
+    val customPayload: String
+        get() = sshPayload
+
     val displayFlag: String
         get() = when (countryCode.uppercase()) {
             "SG" -> "🇸🇬"

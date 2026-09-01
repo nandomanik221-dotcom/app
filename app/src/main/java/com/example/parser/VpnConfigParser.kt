@@ -24,6 +24,7 @@ object VpnConfigParser {
                     trimmed.startsWith("vmess://", ignoreCase = true) -> parseVmess(trimmed)?.let { results.add(it) }
                     trimmed.startsWith("ss://", ignoreCase = true) -> parseShadowsocks(trimmed)?.let { results.add(it) }
                     trimmed.startsWith("ssh://", ignoreCase = true) -> parseSsh(trimmed)?.let { results.add(it) }
+                    trimmed.startsWith("socks5://", ignoreCase = true) -> parseSocks5(trimmed)?.let { results.add(it) }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -111,15 +112,15 @@ object VpnConfigParser {
      */
     fun parseVmess(uriString: String): VpnProfile? {
         return try {
-            val base64Data = uriString.substringAfter("vmess://")
-            val decodedJson = String(Base64.decode(base64Data, Base64.DEFAULT), StandardCharsets.UTF_8)
+            val base64Data = uriString.substringAfter("vmess://").trim()
+            val decodedJson = String(decodeBase64Safe(base64Data), StandardCharsets.UTF_8)
             val json = JSONObject(decodedJson)
 
             val remark = json.optString("ps", "VMess Server")
             val host = json.optString("add", "")
-            val port = json.optInt("port", 443)
+            val port = json.optString("port").toIntOrNull() ?: json.optInt("port", 443)
             val id = json.optString("id", "")
-            val aid = json.optInt("aid", 0)
+            val aid = json.optString("aid").toIntOrNull() ?: json.optInt("aid", 0)
             val scy = json.optString("scy", "auto")
             val net = json.optString("net", "ws")
             val type = json.optString("type", "none")
@@ -166,7 +167,7 @@ object VpnConfigParser {
             if (uri.userInfo != null && uri.host != null) {
                 // Format: ss://base64(method:password)@host:port
                 val decodedUserInfo = try {
-                    String(Base64.decode(uri.userInfo, Base64.NO_WRAP or Base64.URL_SAFE), StandardCharsets.UTF_8)
+                    String(decodeBase64Safe(uri.userInfo ?: ""), StandardCharsets.UTF_8)
                 } catch (e: Exception) {
                     uri.userInfo ?: ""
                 }
@@ -178,26 +179,29 @@ object VpnConfigParser {
                 host = uri.host ?: ""
                 port = if (uri.port != -1) uri.port else 8388
             } else {
-                // Format: ss://base64(method:password@host:port)
+                // Format: ss://base64(method:password@host:port)#remark
                 val rawEncoded = uriString.substringAfter("ss://").substringBefore("#")
-                val decoded = String(Base64.decode(rawEncoded, Base64.NO_WRAP or Base64.URL_SAFE), StandardCharsets.UTF_8)
-                // decoded = method:password@host:port
-                val atSplit = decoded.split("@", limit = 2)
-                if (atSplit.size == 2) {
-                    val auth = atSplit[0].split(":", limit = 2)
-                    if (auth.size == 2) {
-                        method = auth[0]
-                        password = auth[1]
+                val decoded = String(decodeBase64Safe(rawEncoded), StandardCharsets.UTF_8)
+                val atIndex = decoded.lastIndexOf('@')
+                if (atIndex != -1) {
+                    val userPart = decoded.substring(0, atIndex)
+                    val serverPart = decoded.substring(atIndex + 1)
+
+                    val userParts = userPart.split(":", limit = 2)
+                    if (userParts.size == 2) {
+                        method = userParts[0]
+                        password = userParts[1]
                     }
-                    val addr = atSplit[1].split(":", limit = 2)
-                    host = addr[0]
-                    if (addr.size == 2) {
-                        port = addr[1].toIntOrNull() ?: 8388
+
+                    val serverParts = serverPart.split(":", limit = 2)
+                    if (serverParts.size == 2) {
+                        host = serverParts[0]
+                        port = serverParts[1].toIntOrNull() ?: 8388
                     }
                 }
             }
 
-            if (host.isBlank()) return null
+            if (host.isBlank() || password.isBlank()) return null
 
             VpnProfile(
                 name = remark,
@@ -206,7 +210,6 @@ object VpnConfigParser {
                 port = port,
                 password = password,
                 method = method,
-                security = "none",
                 countryCode = detectCountry(remark, host),
                 rawUri = uriString
             )
@@ -216,31 +219,52 @@ object VpnConfigParser {
     }
 
     /**
-     * ssh://username:password@host:port?sni=bug.com&payload=...#SSH-ID
+     * ssh://user:password@host:port#remark
      */
     fun parseSsh(uriString: String): VpnProfile? {
         return try {
             val uri = Uri.parse(uriString)
-            val userInfo = uri.userInfo?.split(":", limit = 2)
-            val username = userInfo?.getOrNull(0) ?: "root"
-            val password = userInfo?.getOrNull(1) ?: ""
+            val username = uri.userInfo?.substringBefore(":") ?: "root"
+            val password = uri.userInfo?.substringAfter(":", "") ?: ""
             val host = uri.host ?: return null
             val port = if (uri.port != -1) uri.port else 22
-            val remark = uri.fragment?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: "SSH Tunnel Server"
-            val sni = uri.getQueryParameter("sni") ?: host
+            val remark = uri.fragment?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: "SSH Tunnel"
+            val sni = uri.getQueryParameter("sni") ?: ""
             val payload = uri.getQueryParameter("payload")?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: ""
-            val isSsl = uri.getQueryParameter("ssl")?.toBoolean() ?: true
 
             VpnProfile(
                 name = remark,
                 protocol = VpnProtocol.SSH,
                 server = host,
                 port = port,
-                sshUsername = username,
-                sshPassword = password,
+                username = username,
+                password = password,
                 sni = sni,
                 sshPayload = payload,
-                sshDirectSsl = isSsl,
+                countryCode = detectCountry(remark, host),
+                rawUri = uriString
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun parseSocks5(uriString: String): VpnProfile? {
+        return try {
+            val uri = Uri.parse(uriString)
+            val username = uri.userInfo?.substringBefore(":") ?: ""
+            val password = uri.userInfo?.substringAfter(":", "") ?: ""
+            val host = uri.host ?: return null
+            val port = if (uri.port != -1) uri.port else 1080
+            val remark = uri.fragment?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: "SOCKS5 Proxy"
+
+            VpnProfile(
+                name = remark,
+                protocol = VpnProtocol.SOCKS5,
+                server = host,
+                port = port,
+                username = username,
+                password = password,
                 countryCode = detectCountry(remark, host),
                 rawUri = uriString
             )
@@ -251,16 +275,6 @@ object VpnConfigParser {
 
     fun exportToUri(profile: VpnProfile): String {
         return when (profile.protocol) {
-            VpnProtocol.TROJAN -> {
-                val encRemark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
-                val encPath = URLEncoder.encode(profile.path, StandardCharsets.UTF_8.name())
-                "trojan://${profile.password}@${profile.server}:${profile.port}?security=${profile.security}&type=${profile.network}&sni=${profile.sni}&path=$encPath&host=${profile.host}#$encRemark"
-            }
-            VpnProtocol.VLESS -> {
-                val encRemark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
-                val encPath = URLEncoder.encode(profile.path, StandardCharsets.UTF_8.name())
-                "vless://${profile.password}@${profile.server}:${profile.port}?type=${profile.network}&security=${profile.security}&sni=${profile.sni}&path=$encPath&host=${profile.host}#$encRemark"
-            }
             VpnProtocol.VMESS -> {
                 val json = JSONObject().apply {
                     put("v", "2")
@@ -269,47 +283,76 @@ object VpnConfigParser {
                     put("port", profile.port)
                     put("id", profile.password)
                     put("aid", 0)
-                    put("scy", profile.method)
-                    put("net", profile.network)
+                    put("scy", profile.method.ifBlank { "auto" })
+                    put("net", profile.network.ifBlank { "ws" })
                     put("type", "none")
                     put("host", profile.host)
-                    put("path", profile.path)
-                    put("tls", profile.security)
+                    put("path", profile.path.ifBlank { "/ws" })
+                    put("tls", if (profile.isTls) "tls" else "none")
                     put("sni", profile.sni)
                 }
-                val base64 = Base64.encodeToString(json.toString().toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
-                "vmess://$base64"
+                "vmess://${Base64.encodeToString(json.toString().toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)}"
+            }
+            VpnProtocol.VLESS -> {
+                val encodedPath = URLEncoder.encode(profile.path, StandardCharsets.UTF_8.name())
+                val remark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
+                "vless://${profile.password}@${profile.server}:${profile.port}?type=${profile.network}&security=${profile.security}&path=$encodedPath&host=${profile.host}&sni=${profile.sni}&pbk=${profile.realityPublicKey}&sid=${profile.realityShortId}#$remark"
+            }
+            VpnProtocol.TROJAN -> {
+                val encodedPath = URLEncoder.encode(profile.path, StandardCharsets.UTF_8.name())
+                val remark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
+                "trojan://${profile.password}@${profile.server}:${profile.port}?security=${profile.security}&type=${profile.network}&sni=${profile.sni}&path=$encodedPath&host=${profile.host}#$remark"
             }
             VpnProtocol.SHADOWSOCKS -> {
-                val auth = "${profile.method}:${profile.password}@${profile.server}:${profile.port}"
-                val base64 = Base64.encodeToString(auth.toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP or Base64.URL_SAFE)
-                val encRemark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
-                "ss://$base64#$encRemark"
+                val userPass = "${profile.method}:${profile.password}"
+                val encoded = Base64.encodeToString(userPass.toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
+                val remark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
+                "ss://$encoded@${profile.server}:${profile.port}#$remark"
             }
             VpnProtocol.SSH -> {
-                val encRemark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
-                val encPayload = URLEncoder.encode(profile.sshPayload, StandardCharsets.UTF_8.name())
-                "ssh://${profile.sshUsername}:${profile.sshPassword}@${profile.server}:${profile.port}?sni=${profile.sni}&ssl=${profile.sshDirectSsl}&payload=$encPayload#$encRemark"
+                val remark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
+                "ssh://${profile.username}:${profile.password}@${profile.server}:${profile.port}?sni=${profile.sni}#$remark"
             }
-            else -> {
-                "socks5://${profile.server}:${profile.port}"
+            VpnProtocol.SOCKS5 -> {
+                val remark = URLEncoder.encode(profile.name, StandardCharsets.UTF_8.name())
+                if (profile.username.isNotBlank()) {
+                    "socks5://${profile.username}:${profile.password}@${profile.server}:${profile.port}#$remark"
+                } else {
+                    "socks5://${profile.server}:${profile.port}#$remark"
+                }
             }
         }
     }
 
-    private fun detectCountry(remark: String, host: String): String {
-        val combined = "$remark $host".uppercase()
+    private fun decodeBase64Safe(input: String): ByteArray {
+        var clean = input.trim().replace("\n", "").replace("\r", "").replace(" ", "")
+        while (clean.length % 4 != 0) {
+            clean += "="
+        }
+        return try {
+            java.util.Base64.getDecoder().decode(clean)
+        } catch (e: Exception) {
+            try {
+                java.util.Base64.getUrlDecoder().decode(clean)
+            } catch (e2: Exception) {
+                Base64.decode(clean, Base64.DEFAULT or Base64.URL_SAFE)
+            }
+        }
+    }
+
+    private fun detectCountry(name: String, host: String): String {
+        val lower = "${name.lowercase()} ${host.lowercase()}"
         return when {
-            combined.contains("SG") || combined.contains("SINGAPORE") -> "SG"
-            combined.contains("ID") || combined.contains("INDONESIA") || combined.contains("JAKARTA") -> "ID"
-            combined.contains("US") || combined.contains("USA") || combined.contains("UNITED STATES") -> "US"
-            combined.contains("JP") || combined.contains("JAPAN") || combined.contains("TOKYO") -> "JP"
-            combined.contains("DE") || combined.contains("GERMANY") || combined.contains("FRANKFURT") -> "DE"
-            combined.contains("NL") || combined.contains("NETHERLAND") || combined.contains("AMSTERDAM") -> "NL"
-            combined.contains("HK") || combined.contains("HONG KONG") -> "HK"
-            combined.contains("UK") || combined.contains("GB") || combined.contains("LONDON") -> "GB"
-            combined.contains("MY") || combined.contains("MALAYSIA") -> "MY"
-            else -> "SG"
+            lower.contains("sg") || lower.contains("singapore") -> "SG"
+            lower.contains("id") || lower.contains("indonesia") || lower.contains("jakarta") -> "ID"
+            lower.contains("us") || lower.contains("united states") || lower.contains("america") -> "US"
+            lower.contains("jp") || lower.contains("japan") || lower.contains("tokyo") -> "JP"
+            lower.contains("de") || lower.contains("germany") || lower.contains("frankfurt") -> "DE"
+            lower.contains("nl") || lower.contains("netherlands") || lower.contains("amsterdam") -> "NL"
+            lower.contains("hk") || lower.contains("hong kong") -> "HK"
+            lower.contains("au") || lower.contains("australia") || lower.contains("sydney") -> "AU"
+            lower.contains("ca") || lower.contains("canada") || lower.contains("toronto") -> "CA"
+            else -> "US"
         }
     }
 }

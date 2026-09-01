@@ -11,16 +11,20 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Embedded Local SOCKS5 Proxy Server (127.0.0.1:10808).
- * Accepts SOCKS5 incoming connections from Tun2Socks / apps, parses target host/port,
- * and relays traffic through the outbound VMess client backend.
+ * Production-ready local SOCKS5 Proxy Server (127.0.0.1:10808).
+ * 
+ * Intercepts SOCKS5 CONNECT requests from the Tun2Socks engine and bridges them
+ * bidirectionally to the remote VMess / Xray outbound tunnel with protected sockets.
  */
 class LocalSocksServer(
     private val vpnService: VpnService,
@@ -29,31 +33,37 @@ class LocalSocksServer(
 ) {
     private val isRunning = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
-    private var listenJob: Job? = null
+    private val serverScope = CoroutineScope(Dispatchers.IO)
+    private var acceptJob: Job? = null
 
     val totalBytesRouted = AtomicLong(0)
+    private val activeSockets = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
 
     fun start(): Boolean {
+        if (isRunning.getAndSet(true)) return true
+
         return try {
             val server = ServerSocket()
             server.reuseAddress = true
             server.bind(InetSocketAddress("127.0.0.1", port))
             serverSocket = server
-            isRunning.set(true)
 
-            VpnLogManager.log(LogLevel.INFO, "XRay SOCKS", "[XRay SOCKS] Local SOCKS5 listener bound on 127.0.0.1:$port")
+            VpnLogManager.log(LogLevel.INFO, "SOCKS5", "[SOCKS5] Local SOCKS5 listener bound successfully to 127.0.0.1:$port")
 
-            listenJob = scope.launch {
+            acceptJob = serverScope.launch {
                 while (isActive && isRunning.get()) {
                     try {
                         val clientSocket = server.accept()
-                        scope.launch {
+                        clientSocket.tcpNoDelay = true
+                        clientSocket.soTimeout = 30000
+                        activeSockets.add(clientSocket)
+
+                        serverScope.launch {
                             handleSocksClient(clientSocket)
                         }
                     } catch (e: Exception) {
                         if (isRunning.get()) {
-                            VpnLogManager.log(LogLevel.WARN, "XRay SOCKS", "[XRay SOCKS] Accept error: ${e.message}")
+                            VpnLogManager.log(LogLevel.WARN, "SOCKS5", "[SOCKS5] Accept error: ${e.message}")
                         }
                         break
                     }
@@ -61,7 +71,8 @@ class LocalSocksServer(
             }
             true
         } catch (e: Exception) {
-            VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] Failed to start SOCKS5 listener on port $port: ${e.message}")
+            isRunning.set(false)
+            VpnLogManager.log(LogLevel.ERROR, "SOCKS5", "[SOCKS5] Failed to bind port $port: ${e.message}")
             false
         }
     }
@@ -69,116 +80,143 @@ class LocalSocksServer(
     private suspend fun handleSocksClient(clientSocket: Socket) {
         var remoteSocket: Socket? = null
         try {
-            clientSocket.tcpNoDelay = true
-            val clientIn = clientSocket.getInputStream()
-            val clientOut = clientSocket.getOutputStream()
+            val cIn = clientSocket.getInputStream()
+            val cOut = clientSocket.getOutputStream()
 
-            // 1. SOCKS5 Handshake: Auth negotiation
-            val ver = clientIn.read()
+            // 1. SOCKS5 Method Negotiation Greeting
+            val ver = cIn.read()
             if (ver != 0x05) {
-                clientSocket.close()
-                return
+                return // Not SOCKS5
             }
-            val nMethods = clientIn.read()
+            val nMethods = cIn.read()
             val methods = ByteArray(nMethods)
-            clientIn.read(methods)
+            readFully(cIn, methods)
 
-            // Reply NO AUTH (0x05, 0x00)
-            clientOut.write(byteArrayOf(0x05, 0x00))
-            clientOut.flush()
+            // Reply NO_AUTH (0x05, 0x00)
+            cOut.write(byteArrayOf(0x05, 0x00))
+            cOut.flush()
 
-            // 2. SOCKS5 Request
-            val reqVer = clientIn.read()
-            val cmd = clientIn.read() // 0x01 = CONNECT
-            val rsv = clientIn.read()
-            val atyp = clientIn.read()
+            // 2. SOCKS5 Request Details
+            val reqHeader = ByteArray(4)
+            readFully(cIn, reqHeader)
 
-            if (reqVer != 0x05 || cmd != 0x01) {
-                // Command not supported
-                clientOut.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOut.flush()
-                clientSocket.close()
+            val cmd = reqHeader[1].toInt() and 0xFF
+            val atyp = reqHeader[3].toInt() and 0xFF
+
+            if (cmd != 0x01) { // 0x01 = CONNECT
+                cOut.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0)) // Command not supported
+                cOut.flush()
                 return
             }
 
-            var destHost = ""
+            val targetHost: String
             when (atyp) {
                 0x01 -> { // IPv4
                     val ipBytes = ByteArray(4)
-                    clientIn.read(ipBytes)
-                    destHost = "${ipBytes[0].toInt() and 0xFF}.${ipBytes[1].toInt() and 0xFF}.${ipBytes[2].toInt() and 0xFF}.${ipBytes[3].toInt() and 0xFF}"
+                    readFully(cIn, ipBytes)
+                    targetHost = InetAddress.getByAddress(ipBytes).hostAddress ?: "127.0.0.1"
                 }
                 0x03 -> { // Domain name
-                    val len = clientIn.read()
-                    val domainBytes = ByteArray(len)
-                    clientIn.read(domainBytes)
-                    destHost = String(domainBytes)
+                    val domainLen = cIn.read()
+                    val domainBytes = ByteArray(domainLen)
+                    readFully(cIn, domainBytes)
+                    targetHost = String(domainBytes, Charsets.UTF_8)
                 }
                 0x04 -> { // IPv6
-                    val ipBytes = ByteArray(16)
-                    clientIn.read(ipBytes)
-                    destHost = "ipv6"
+                    val ip6Bytes = ByteArray(16)
+                    readFully(cIn, ip6Bytes)
+                    targetHost = InetAddress.getByAddress(ip6Bytes).hostAddress ?: "::1"
+                }
+                else -> {
+                    cOut.write(byteArrayOf(0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    cOut.flush()
+                    return
                 }
             }
 
-            val p1 = clientIn.read()
-            val p2 = clientIn.read()
-            val destPort = ((p1 and 0xFF) shl 8) or (p2 and 0xFF)
+            val portBytes = ByteArray(2)
+            readFully(cIn, portBytes)
+            val targetPort = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
 
-            VpnLogManager.log(LogLevel.CONN, "VMESS CONNECT", "[VMESS CONNECT] SOCKS5 target request: $destHost:$destPort via VMess outbound")
-
-            // 3. Connect outbound via VMess client
-            val outbound = Socket()
-            vpnService.protect(outbound)
-            outbound.tcpNoDelay = true
-            outbound.connect(InetSocketAddress(destHost, destPort), 8000)
-            remoteSocket = outbound
-
-            // SOCKS5 success reply: 0x05, 0x00 (succeeded), 0x00 (RSV), 0x01 (IPv4), 0,0,0,0 (BND.ADDR), 0,0 (BND.PORT)
-            clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-            clientOut.flush()
-
-            // 4. Bidirectional data pipe
-            val remoteIn = outbound.getInputStream()
-            val remoteOut = outbound.getOutputStream()
-
-            val jobUpload = scope.launch {
-                pipeStream(clientIn, remoteOut)
-            }
-            val jobDownload = scope.launch {
-                pipeStream(remoteIn, clientOut)
+            // 3. Connect to remote destination via VMess client
+            try {
+                remoteSocket = vmessClient.createTunnelSocket(targetHost, targetPort)
+                activeSockets.add(remoteSocket)
+            } catch (e: Exception) {
+                cOut.write(byteArrayOf(0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0)) // Host unreachable
+                cOut.flush()
+                return
             }
 
-            jobUpload.join()
-            jobDownload.join()
+            // SOCKS5 Success Response
+            cOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+            cOut.flush()
+
+            // 4. Bidirectional Relay
+            val rIn = remoteSocket.getInputStream()
+            val rOut = remoteSocket.getOutputStream()
+
+            val job1 = serverScope.launch {
+                relayStream(cIn, rOut)
+            }
+            val job2 = serverScope.launch {
+                relayStream(rIn, cOut)
+            }
+
+            job1.join()
+            job2.join()
 
         } catch (e: Exception) {
-            // Connection closed or reset
+            // Connection closed
         } finally {
+            activeSockets.remove(clientSocket)
             try { clientSocket.close() } catch (ignored: Exception) {}
-            try { remoteSocket?.close() } catch (ignored: Exception) {}
+            remoteSocket?.let { sock ->
+                activeSockets.remove(sock)
+                try { sock.close() } catch (ignored: Exception) {}
+            }
         }
     }
 
-    private fun pipeStream(input: InputStream, output: OutputStream) {
+    private fun relayStream(input: InputStream, output: OutputStream) {
         val buffer = ByteArray(16384)
         try {
             while (isRunning.get()) {
-                val n = input.read(buffer)
-                if (n <= 0) break
-                output.write(buffer, 0, n)
+                val bytesRead = input.read(buffer)
+                if (bytesRead <= 0) break
+                output.write(buffer, 0, bytesRead)
                 output.flush()
-                totalBytesRouted.addAndGet(n.toLong())
+                totalBytesRouted.addAndGet(bytesRead.toLong())
             }
-        } catch (ignored: Exception) {}
+        } catch (ignored: Exception) {
+        } finally {
+            try { output.close() } catch (ignored: Exception) {}
+        }
+    }
+
+    private fun readFully(input: InputStream, buffer: ByteArray) {
+        var total = 0
+        while (total < buffer.size) {
+            val n = input.read(buffer, total, buffer.size - total)
+            if (n == -1) throw IllegalStateException("Unexpected EOF in SOCKS5 stream")
+            total += n
+        }
     }
 
     fun stop() {
         if (!isRunning.getAndSet(false)) return
-        listenJob?.cancel()
+        acceptJob?.cancel()
+
         try {
             serverSocket?.close()
         } catch (ignored: Exception) {}
-        VpnLogManager.log(LogLevel.INFO, "XRay SOCKS", "[XRay SOCKS] Local SOCKS listener stopped.")
+        serverSocket = null
+
+        activeSockets.forEach { sock ->
+            try { sock.close() } catch (ignored: Exception) {}
+        }
+        activeSockets.clear()
+
+        VpnLogManager.log(LogLevel.INFO, "SOCKS5", "[SOCKS5] Local SOCKS5 listener closed cleanly.")
     }
 }

@@ -194,7 +194,7 @@ fun DashboardScreen(
                     StatusItem(
                         icon = Icons.Default.Public,
                         label = "Public IP",
-                        value = if (isConnected) metrics.publicIp else "182.1.204.55 (Real)",
+                        value = if (isConnected) metrics.publicIp.ifBlank { "-" } else "Disconnected",
                         highlight = isConnected,
                         modifier = Modifier.weight(1f)
                     )
@@ -202,7 +202,7 @@ fun DashboardScreen(
                     StatusItem(
                         icon = Icons.Default.LocationOn,
                         label = "Location",
-                        value = if (isConnected) "${activeProfile?.countryCode ?: "SG"} (Singapore)" else "Indonesia (ID)",
+                        value = if (isConnected) (activeProfile?.countryCode ?: "-") else "-",
                         highlight = isConnected,
                         modifier = Modifier.weight(1f)
                     )
