@@ -219,8 +219,11 @@ class SshTunnelClient(
 
         var currentSocket: Socket = rawSocket
 
-        // 2. Remote Proxy handling for both TLS and Enhanced modes
-        if (profile.remoteProxyEnabled && profile.remoteProxyHost.isNotBlank()) {
+        val isSsl = profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
+        val hasRemoteProxy = profile.remoteProxyEnabled && profile.remoteProxyHost.isNotBlank()
+        val hasPayload = profile.sshPayload.isNotBlank()
+
+        if (hasRemoteProxy) {
             val proxyHost = profile.remoteProxyHost.trim()
             val proxyPort = if (profile.remoteProxyPort > 0) profile.remoteProxyPort else 8080
             val proxyType = profile.remoteProxyType.uppercase()
@@ -229,31 +232,60 @@ class SshTunnelClient(
             currentSocket.connect(InetSocketAddress(proxyHost, proxyPort), 10000)
 
             if (proxyType == "SOCKS5") {
+                // SOCKS5 Remote Proxy
                 performSocks5ProxyHandshake(currentSocket, serverHost, serverPort)
-            } else {
-                if (profile.sshPayload.isNotBlank()) {
+
+                if (isSsl) {
+                    currentSocket = performTlsHandshake(currentSocket, serverHost, serverPort)
+                }
+                if (hasPayload) {
                     currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
-                } else {
+                }
+            } else {
+                // HTTP / HTTPS Remote Proxy
+                if (proxyPort == 443 || (isSsl && (proxyHost.equals(profile.sni, ignoreCase = true) || profile.sni.isBlank()))) {
+                    // Remote Proxy is an SSL/TLS endpoint (e.g. ads.ruangguru.com:443)
+                    // Establish TLS to proxy first with SNI
+                    currentSocket = performTlsHandshake(currentSocket, proxyHost, proxyPort)
+
+                    // Inject custom payload inside TLS
+                    if (hasPayload) {
+                        currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+                    } else {
+                        performHttpProxyConnect(currentSocket, serverHost, serverPort)
+                    }
+                } else if (isSsl) {
+                    // Plain HTTP Proxy (e.g. 8080) with TLS to target
                     performHttpProxyConnect(currentSocket, serverHost, serverPort)
+                    currentSocket = performTlsHandshake(currentSocket, serverHost, serverPort)
+                    if (hasPayload) {
+                        currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+                    }
+                } else {
+                    // Plain HTTP Proxy without TLS (Enhanced / Direct mode via HTTP Proxy)
+                    if (hasPayload) {
+                        currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+                    } else {
+                        performHttpProxyConnect(currentSocket, serverHost, serverPort)
+                    }
                 }
             }
         } else {
+            // Direct Connection to SSH Server
             VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Connecting directly to $serverHost:$serverPort...")
             currentSocket.connect(InetSocketAddress(serverHost, serverPort), 10000)
 
-            if (profile.sshPayload.isNotBlank() && !profile.sshDirectSsl && !profile.isTls) {
-                currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
-            }
-        }
-
-        // 3. SSL/TLS Encapsulation if enabled (TLS mode with SNI)
-        val isSsl = profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
-        if (isSsl) {
-            currentSocket = performTlsHandshake(currentSocket, serverHost, serverPort)
-
-            // Inner payload injection over TLS if payload is present
-            if (profile.sshPayload.isNotBlank() && (!profile.remoteProxyEnabled || profile.remoteProxyType.uppercase() == "SOCKS5")) {
-                currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+            if (isSsl) {
+                // Direct SSL/TLS Mode
+                currentSocket = performTlsHandshake(currentSocket, serverHost, serverPort)
+                if (hasPayload) {
+                    currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+                }
+            } else {
+                // Direct TCP / Enhanced Mode
+                if (hasPayload) {
+                    currentSocket = handleCustomPayload(currentSocket, serverHost, serverPort)
+                }
             }
         }
 
@@ -287,28 +319,21 @@ class SshTunnelClient(
         out.write(connectBuilder.toString().toByteArray(StandardCharsets.US_ASCII))
         out.flush()
 
-        val statusLine = readLine(inStream)
-        VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] $statusLine")
+        val resp = HttpStatusParser.consumeSingleResponse(inStream)
+            ?: throw IllegalStateException("Remote HTTP proxy closed connection prematurely during CONNECT")
 
-        val statusCode = HttpStatusParser.parseStatusCode(statusLine)
+        VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${resp.statusLine}")
 
-        if (statusCode == 407) {
+        if (resp.statusCode == 407) {
             VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY] HTTP CONNECT failed: 407 Proxy Authentication Required")
             throw IllegalStateException("HTTP Proxy authentication required (HTTP 407)")
         }
 
-        if (statusCode != 200) {
-            // Apply response replacement if intermediate response received
+        if (resp.statusCode != 200) {
             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] HTTP/1.0 200 Connection established")
         } else {
             VpnLogManager.log(LogLevel.CONN, "PROXY", "[PROXY] HTTP 200 Connection Established")
-        }
-
-        // Consume remaining headers
-        while (true) {
-            val line = readLine(inStream)
-            if (line.isBlank()) break
         }
     }
 
@@ -338,9 +363,28 @@ class SshTunnelClient(
         out.flush()
 
         val ver = inStream.read()
-        val method = inStream.read()
-        if (ver != 0x05) throw IllegalStateException("Invalid SOCKS5 version response: $ver")
+        if (ver == -1) {
+            throw IllegalStateException("Remote Proxy closed connection during SOCKS5 greeting")
+        }
+        if (ver != 0x05) {
+            // Safe forensic inspection of non-SOCKS5 greeting without logging credentials
+            val peek = ByteArray(15)
+            val peekCount = if (inStream.available() > 0) inStream.read(peek, 0, minOf(peek.size, inStream.available())) else 0
+            val fullBytes = ByteArray(1 + peekCount)
+            fullBytes[0] = ver.toByte()
+            if (peekCount > 0) System.arraycopy(peek, 0, fullBytes, 1, peekCount)
+            val peekStr = String(fullBytes, StandardCharsets.ISO_8859_1).filter { it in ' '..'~' }
 
+            if (ver == 0x48 || peekStr.startsWith("HTTP", ignoreCase = true)) {
+                VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY ERROR] Remote Proxy returned HTTP response ('$peekStr') instead of SOCKS5 version 0x05. Remote Proxy is an HTTP/HTTPS server, not a SOCKS5 server.")
+                throw IllegalStateException("Remote Proxy returned HTTP text ($peekStr) instead of SOCKS5 version 5 (byte $ver / 'H'). Set Remote Proxy Type to 'HTTP'.")
+            } else {
+                VpnLogManager.log(LogLevel.ERROR, "PROXY", "[PROXY ERROR] Invalid SOCKS5 version response: $ver (hex 0x${Integer.toHexString(ver)}, peek='$peekStr')")
+                throw IllegalStateException("Invalid SOCKS5 version response: $ver")
+            }
+        }
+
+        val method = inStream.read()
         if (method == 0x02 && hasAuth) {
             // RFC 1929 Sub-negotiation
             val userBytes = proxyUser.toByteArray(StandardCharsets.UTF_8)
@@ -472,35 +516,33 @@ class SshTunnelClient(
 
         when (mode) {
             PayloadMode.WEBSOCKET -> {
-                val statusLine = readLine(inStream)
-                VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] $statusLine")
-                val statusCode = HttpStatusParser.parseStatusCode(statusLine)
+                // First response block (e.g. 403 Forbidden, 101 Switching Protocols, 421 Misdirected, 400 Bad Request, etc.)
+                val firstResp = HttpStatusParser.consumeSingleResponse(inStream)
+                    ?: throw IllegalStateException("Remote endpoint closed connection immediately after payload injection")
 
-                if (statusCode != 101) {
-                    // Response replacement for intermediate proxy / CDN responses (e.g. 403, 200, 302)
+                VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${firstResp.statusLine}")
+
+                if (firstResp.statusCode != 101) {
                     VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
                     VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] HTTP/1.0 200 Connection established")
                 }
 
-                // Consume headers for this response block
-                while (true) {
-                    val line = readLine(inStream)
-                    if (line.isBlank()) break
-                }
+                // Check for second response stage (e.g. 101 Switching Protocols following intermediate 403 / 200 / 302 / 421)
+                if (firstResp.statusCode != 101) {
+                    try {
+                        var waited = 0
+                        while (inStream.available() == 0 && waited < 400) {
+                            Thread.sleep(50)
+                            waited += 50
+                        }
+                    } catch (_: Exception) {}
 
-                // Check if 101 Switching Protocols follows immediately
-                if (statusCode != 101 && inStream.available() > 0) {
-                    val nextStatusLine = readLine(inStream)
-                    if (nextStatusLine.isNotBlank()) {
-                        VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] $nextStatusLine")
-                        val nextCode = HttpStatusParser.parseStatusCode(nextStatusLine)
-                        if (nextCode == 101 || nextCode == 200) {
+                    if (inStream.available() > 0) {
+                        val secondResp = HttpStatusParser.consumeSingleResponse(inStream)
+                        if (secondResp != null) {
+                            VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${secondResp.statusLine}")
                             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
                             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] HTTP/1.0 200 Connection established")
-                            while (true) {
-                                val line = readLine(inStream)
-                                if (line.isBlank()) break
-                            }
                         }
                     }
                 }
@@ -509,26 +551,17 @@ class SshTunnelClient(
                 return WebSocketFramedSocket(socket)
             }
             PayloadMode.PAYLOAD_WITH_HTTP_RESPONSE -> {
-                val statusLine = readLine(inStream)
-                VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] $statusLine")
-                val statusCode = HttpStatusParser.parseStatusCode(statusLine)
-
-                if (statusCode != null && (statusCode in 200..299 || statusCode == 403 || statusCode == 101)) {
-                    if (statusCode == 403 || statusCode == 101) {
+                val resp = HttpStatusParser.consumeSingleResponse(inStream)
+                if (resp != null) {
+                    VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${resp.statusLine}")
+                    if (resp.statusCode != 200) {
                         VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
                         VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] HTTP/1.0 200 Connection established")
                     }
-                    while (true) {
-                        val line = readLine(inStream)
-                        if (line.isBlank()) break
-                    }
-                } else if (statusCode != null) {
-                    VpnLogManager.log(LogLevel.WARN, "PAYLOAD", "[PAYLOAD] Status: $statusLine")
                 }
                 return socket
             }
             PayloadMode.PAYLOAD_ONLY, PayloadMode.NONE -> {
-                // Do not consume stream; remote endpoint immediately begins SSH banner exchange
                 return socket
             }
         }

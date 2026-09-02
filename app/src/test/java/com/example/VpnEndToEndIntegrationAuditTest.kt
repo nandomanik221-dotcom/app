@@ -382,4 +382,61 @@ class VpnEndToEndIntegrationAuditTest {
 
         assertEquals(PayloadMode.NONE, HttpStatusParser.detectPayloadMode(""))
     }
+
+    @Test
+    fun testConsumeSingleResponseWithContentLengthBody() {
+        val body = "<html>403</html>"
+        val rawHttp = "HTTP/1.1 403 Forbidden\r\nServer: cloudflare\r\nContent-Type: text/html\r\nContent-Length: ${body.length}\r\n\r\n$body"
+        val inStream = java.io.ByteArrayInputStream(rawHttp.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+
+        val parsed = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(parsed)
+        assertEquals("HTTP/1.1 403 Forbidden", parsed?.statusLine)
+        assertEquals(403, parsed?.statusCode)
+        assertEquals("cloudflare", parsed?.headers?.get("server"))
+        assertEquals(body.length, parsed?.bodyLength)
+        assertEquals(0, inStream.available())
+    }
+
+    @Test
+    fun testMultiStageResponseStreamConsumption() {
+        // Multi-stage response: 403 with body followed by 101 Switching Protocols followed by SSH banner
+        val body = "<error>403</error>"
+        val stage1 = "HTTP/1.1 403 Forbidden\r\nServer: cdn\r\nContent-Length: ${body.length}\r\n\r\n$body"
+        val stage2 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        val sshStream = "SSH-2.0-OpenSSH_8.9\r\n"
+        val fullData = stage1 + stage2 + sshStream
+
+        val inStream = java.io.ByteArrayInputStream(fullData.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+
+        // First response stage
+        val resp1 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp1)
+        assertEquals(403, resp1?.statusCode)
+        assertEquals(body.length, resp1?.bodyLength)
+
+        // Second response stage
+        val resp2 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp2)
+        assertEquals(101, resp2?.statusCode)
+
+        // Verify remaining stream contains the pristine SSH banner without any leftover HTML bytes
+        val remainingBytes = inStream.readBytes()
+        val remainingStr = String(remainingBytes, java.nio.charset.StandardCharsets.UTF_8)
+        assertEquals("SSH-2.0-OpenSSH_8.9\r\n", remainingStr)
+    }
+
+    @Test
+    fun testChunkedBodyConsumption() {
+        val chunkedHttp = "HTTP/1.1 421 Misdirected Request\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\nNEXT_DATA"
+        val inStream = java.io.ByteArrayInputStream(chunkedHttp.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+
+        val parsed = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(parsed)
+        assertEquals(421, parsed?.statusCode)
+        assertEquals(11, parsed?.bodyLength)
+
+        val remaining = inStream.readBytes()
+        assertEquals("NEXT_DATA", String(remaining, java.nio.charset.StandardCharsets.UTF_8))
+    }
 }
