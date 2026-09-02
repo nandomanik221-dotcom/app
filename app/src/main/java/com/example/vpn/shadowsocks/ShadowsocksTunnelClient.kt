@@ -39,7 +39,8 @@ class ShadowsocksTunnelClient(
 
             VpnLogManager.log(LogLevel.CONN, "SHADOWSOCKS CONNECT", "[SHADOWSOCKS CONNECT] Connecting to remote Shadowsocks server $serverHost:$serverPort (Cipher: ${profile.method})...")
 
-            val rawSocket = Socket()
+            val socketChannel = java.nio.channels.SocketChannel.open()
+            val rawSocket = socketChannel.socket()
             vpnService.protect(rawSocket)
             rawSocket.tcpNoDelay = true
             rawSocket.soTimeout = 10000
@@ -63,7 +64,8 @@ class ShadowsocksTunnelClient(
         val serverHost = profile.server
         val serverPort = profile.port
 
-        val rawSocket = Socket()
+        val socketChannel = java.nio.channels.SocketChannel.open()
+        val rawSocket = socketChannel.socket()
         vpnService.protect(rawSocket)
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 30000

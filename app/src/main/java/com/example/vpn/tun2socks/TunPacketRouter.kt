@@ -55,7 +55,7 @@ class TunPacketRouter(
     private var tunOutputStream: FileOutputStream? = null
     private val writeLock = Any()
 
-    private val dnsSocket = DatagramSocket().apply {
+    private val dnsSocket = java.nio.channels.DatagramChannel.open().socket().apply {
         soTimeout = 5000
         vpnService.protect(this)
     }

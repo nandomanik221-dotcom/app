@@ -59,11 +59,26 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
         val localAddr = try { socket.localSocketAddress?.toString() } catch (_: Exception) { "unknown" }
         val remoteAddr = try { socket.remoteSocketAddress?.toString() } catch (_: Exception) { "unconnected" }
         val socketClass = socket.javaClass.name
+        val socketId = System.identityHashCode(socket)
+
+        val fdInt = try {
+            val fd = socket.channel?.let {
+                // If channel exists, inspect fd if possible
+                null
+            }
+            // Use reflection or standard getter to safely inspect fd for diagnostic logging
+            val getFdMethod = socket.javaClass.getMethod("getFileDescriptor$")
+            val pfd = getFdMethod.invoke(socket) as? java.io.FileDescriptor
+            val getIntMethod = pfd?.javaClass?.getMethod("getInt$")
+            getIntMethod?.invoke(pfd) as? Int ?: -1
+        } catch (_: Exception) {
+            -1
+        }
 
         VpnLogManager.log(
             LogLevel.CONN,
             "PROTECT",
-            "[PROTECT BEFORE] socketClass=$socketClass, isConnected=$isConnected, isBound=$isBound, isClosed=$isClosed, local=$localAddr, remote=$remoteAddr, thread=$threadName, tunActive=$tunActive"
+            "[PROTECT BEFORE] socketId=$socketId, socketClass=$socketClass, fd=$fdInt, isConnected=$isConnected, isBound=$isBound, isClosed=$isClosed, local=$localAddr, remote=$remoteAddr, thread=$threadName, tunActive=$tunActive"
         )
 
         return try {
@@ -71,7 +86,7 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
             VpnLogManager.log(
                 if (result) LogLevel.INFO else LogLevel.ERROR,
                 "PROTECT",
-                "[PROTECT AFTER] result=$result, socketClass=$socketClass, tunActive=$tunActive"
+                "[PROTECT AFTER] socketId=$socketId, result=$result, fd=$fdInt, socketClass=$socketClass, tunActive=$tunActive"
             )
             result
         } catch (e: Exception) {
@@ -80,7 +95,7 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
             VpnLogManager.log(
                 LogLevel.ERROR,
                 "PROTECT",
-                "[PROTECT EXCEPTION] exception=$excClass: $excMsg, socketClass=$socketClass, tunActive=$tunActive"
+                "[PROTECT EXCEPTION] socketId=$socketId, exception=$excClass: $excMsg, socketClass=$socketClass, tunActive=$tunActive"
             )
             false
         }
@@ -94,11 +109,21 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
         val isClosed = socket.isClosed
         val localAddr = try { socket.localSocketAddress?.toString() } catch (_: Exception) { "unknown" }
         val socketClass = socket.javaClass.name
+        val socketId = System.identityHashCode(socket)
+
+        val fdInt = try {
+            val getFdMethod = socket.javaClass.getMethod("getFileDescriptor$")
+            val pfd = getFdMethod.invoke(socket) as? java.io.FileDescriptor
+            val getIntMethod = pfd?.javaClass?.getMethod("getInt$")
+            getIntMethod?.invoke(pfd) as? Int ?: -1
+        } catch (_: Exception) {
+            -1
+        }
 
         VpnLogManager.log(
             LogLevel.CONN,
             "PROTECT",
-            "[PROTECT UDP BEFORE] socketClass=$socketClass, isConnected=$isConnected, isBound=$isBound, isClosed=$isClosed, local=$localAddr, thread=$threadName, tunActive=$tunActive"
+            "[PROTECT UDP BEFORE] socketId=$socketId, socketClass=$socketClass, fd=$fdInt, isConnected=$isConnected, isBound=$isBound, isClosed=$isClosed, local=$localAddr, thread=$threadName, tunActive=$tunActive"
         )
 
         return try {
@@ -106,7 +131,7 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
             VpnLogManager.log(
                 if (result) LogLevel.INFO else LogLevel.ERROR,
                 "PROTECT",
-                "[PROTECT UDP AFTER] result=$result, socketClass=$socketClass, tunActive=$tunActive"
+                "[PROTECT UDP AFTER] socketId=$socketId, result=$result, fd=$fdInt, socketClass=$socketClass, tunActive=$tunActive"
             )
             result
         } catch (e: Exception) {
@@ -115,7 +140,7 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
             VpnLogManager.log(
                 LogLevel.ERROR,
                 "PROTECT",
-                "[PROTECT UDP EXCEPTION] exception=$excClass: $excMsg, socketClass=$socketClass, tunActive=$tunActive"
+                "[PROTECT UDP EXCEPTION] socketId=$socketId, exception=$excClass: $excMsg, socketClass=$socketClass, tunActive=$tunActive"
             )
             false
         }
@@ -294,7 +319,11 @@ class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
                 ?: throw IllegalStateException("Failed to establish Android TUN interface (permission or system conflict).")
 
             vpnInterface = vpnPfd
-            VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] TUN interface active (MTU: 1500, IPv4: 10.8.0.2/24, IPv6: fd00::2/120)")
+            try {
+                setUnderlyingNetworks(null)
+            } catch (_: Exception) {}
+
+            VpnLogManager.log(LogLevel.INFO, "TUN", "[TUN] establish() returned fd ${vpnPfd.fd} (MTU: 1500, IPv4: 10.8.0.2/24, IPv6: fd00::2/120)")
 
             // 4. Dispatch to the dedicated protocol backend (SSH, VMess, VLESS, Trojan, SS, SOCKS5)
             val backend = VpnBackendDispatcher.dispatch(this@V2TunnelVpnService, profile)

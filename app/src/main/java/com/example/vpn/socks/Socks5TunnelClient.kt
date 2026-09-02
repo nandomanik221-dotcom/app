@@ -38,7 +38,8 @@ class Socks5TunnelClient(
 
             VpnLogManager.log(LogLevel.CONN, "SOCKS5 CONNECT", "[SOCKS5 CONNECT] Connecting to remote SOCKS5 server $serverHost:$serverPort...")
 
-            val rawSocket = Socket()
+            val socketChannel = java.nio.channels.SocketChannel.open()
+            val rawSocket = socketChannel.socket()
             vpnService.protect(rawSocket)
             rawSocket.tcpNoDelay = true
             rawSocket.soTimeout = 10000
@@ -74,7 +75,8 @@ class Socks5TunnelClient(
         val serverHost = profile.server
         val serverPort = profile.port
 
-        val rawSocket = Socket()
+        val socketChannel = java.nio.channels.SocketChannel.open()
+        val rawSocket = socketChannel.socket()
         vpnService.protect(rawSocket)
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 30000

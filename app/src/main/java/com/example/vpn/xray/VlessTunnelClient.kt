@@ -49,7 +49,8 @@ class VlessTunnelClient(
 
             VpnLogManager.log(LogLevel.CONN, "VLESS CONNECT", "[VLESS CONNECT] Connecting to remote VLESS server $serverHost:$serverPort...")
 
-            val rawSocket = Socket()
+            val socketChannel = java.nio.channels.SocketChannel.open()
+            val rawSocket = socketChannel.socket()
             vpnService.protect(rawSocket)
             rawSocket.tcpNoDelay = true
             rawSocket.soTimeout = 10000
@@ -106,7 +107,8 @@ class VlessTunnelClient(
         val rawSni = profile.sni.ifBlank { profile.host.ifBlank { serverHost } }
         val cleanSni = SniUtils.sanitizeSni(rawSni, serverHost)
 
-        val rawSocket = Socket()
+        val socketChannel = java.nio.channels.SocketChannel.open()
+        val rawSocket = socketChannel.socket()
         vpnService.protect(rawSocket)
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 30000

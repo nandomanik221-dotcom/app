@@ -341,4 +341,45 @@ class VpnEndToEndIntegrationAuditTest {
         assertTrue("Protect succeeds after TUN is active", resultAfterTun)
         assertTrue("TUN was active during protect", tunStateDuringProtect)
     }
+
+    @Test
+    fun testSocketChannelSocketCreationHasAllocatedDescriptor() {
+        val channel = java.nio.channels.SocketChannel.open()
+        val socket = channel.socket()
+        assertNotNull(socket)
+        assertFalse(socket.isConnected)
+        assertFalse(socket.isBound)
+        assertFalse(socket.isClosed)
+
+        // Verify channel is open and valid
+        assertTrue(channel.isOpen)
+        socket.close()
+        assertTrue(socket.isClosed)
+    }
+
+    @Test
+    fun testHttpStatusParserStatusLineParsing() {
+        assertEquals(403, HttpStatusParser.parseStatusCode("HTTP/1.1 403 Forbidden"))
+        assertEquals(101, HttpStatusParser.parseStatusCode("HTTP/1.1 101 Switching Protocols"))
+        assertEquals(200, HttpStatusParser.parseStatusCode("HTTP/1.0 200 Connection established"))
+        assertEquals(200, HttpStatusParser.parseStatusCode("HTTP/1.1 200 OK"))
+        assertEquals(302, HttpStatusParser.parseStatusCode("HTTP/1.1 302 Found"))
+        assertEquals(407, HttpStatusParser.parseStatusCode("HTTP/1.1 407 Proxy Authentication Required"))
+        assertEquals(502, HttpStatusParser.parseStatusCode("HTTP/1.1 502 Bad Gateway"))
+        assertNull(HttpStatusParser.parseStatusCode("Invalid Status Line"))
+    }
+
+    @Test
+    fun testPayloadModeDetection() {
+        val wsPayload = "GET /ws HTTP/1.1[crlf]Host: example.com[crlf]Upgrade: websocket[crlf][crlf]"
+        assertEquals(PayloadMode.WEBSOCKET, HttpStatusParser.detectPayloadMode(wsPayload))
+
+        val httpPayload = "CONNECT [host_port] HTTP/1.1[crlf]Host: [host_port][crlf][crlf]"
+        assertEquals(PayloadMode.PAYLOAD_WITH_HTTP_RESPONSE, HttpStatusParser.detectPayloadMode(httpPayload))
+
+        val splitPayload = "GET / HTTP/1.1[crlf]Host: [host][crlf][split][crlf]"
+        assertEquals(PayloadMode.PAYLOAD_ONLY, HttpStatusParser.detectPayloadMode(splitPayload))
+
+        assertEquals(PayloadMode.NONE, HttpStatusParser.detectPayloadMode(""))
+    }
 }

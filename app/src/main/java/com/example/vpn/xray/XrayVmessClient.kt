@@ -66,7 +66,8 @@ class XrayVmessClient(
             VpnLogManager.log(LogLevel.CONN, "VMESS TCP CONNECT", "[VMESS TCP CONNECT] Connecting to remote host $serverHost:$serverPort...")
 
             // 1. Establish protected TCP socket
-            val rawSocket = Socket()
+            val socketChannel = java.nio.channels.SocketChannel.open()
+            val rawSocket = socketChannel.socket()
             vpnService.protect(rawSocket)
             rawSocket.tcpNoDelay = true
             rawSocket.soTimeout = 10000
@@ -171,7 +172,8 @@ class XrayVmessClient(
         val serverHost = profile.server
         val serverPort = profile.port
 
-        val rawSocket = Socket()
+        val socketChannel = java.nio.channels.SocketChannel.open()
+        val rawSocket = socketChannel.socket()
         vpnService.protect(rawSocket)
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 30000
