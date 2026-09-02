@@ -6,6 +6,7 @@ import com.example.model.LogLevel
 import com.example.model.VpnProfile
 import com.example.vpn.VpnLogManager
 import com.example.vpn.backend.ITunnelBackend
+import com.example.vpn.backend.UpstreamSocketProtector
 import com.example.vpn.util.HttpStatusParser
 import com.example.vpn.util.PayloadMode
 import com.example.vpn.util.SniUtils
@@ -17,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -44,9 +46,18 @@ import javax.net.ssl.SSLSocketFactory
  * 8. Real end-to-end connectivity verification and atomic byte counting
  */
 class SshTunnelClient(
-    private val vpnService: VpnService,
+    private val socketProtector: UpstreamSocketProtector,
     private val profile: VpnProfile
 ) : ITunnelBackend {
+
+    constructor(vpnService: VpnService, profile: VpnProfile) : this(
+        if (vpnService is UpstreamSocketProtector) vpnService else object : UpstreamSocketProtector {
+            override fun protect(socket: Socket): Boolean = vpnService.protect(socket)
+            override fun protect(socket: DatagramSocket): Boolean = vpnService.protect(socket)
+            override fun isVpnInterfaceActive(): Boolean = true
+        },
+        profile
+    )
 
     override val backendName: String = "SSH"
     override val totalBytesSent = AtomicLong(0L)
@@ -185,13 +196,18 @@ class SshTunnelClient(
      */
     private fun establishTransportSocket(serverHost: String, serverPort: Int): Socket {
         val rawSocket = Socket()
+        val tunActive = socketProtector.isVpnInterfaceActive()
+
+        VpnLogManager.log(LogLevel.CONN, "PROTECT", "[PROTECT] Requesting upstream socket protection (TUN Active: $tunActive)...")
 
         // 1. Mandatory VpnService.protect() BEFORE socket.connect()
-        val protected = vpnService.protect(rawSocket)
+        val protected = socketProtector.protect(rawSocket)
         if (!protected) {
             rawSocket.close()
-            throw IllegalStateException("Failed to protect upstream socket from VPN routing loop")
+            throw IllegalStateException("Failed to protect upstream socket from VPN routing loop (TUN Active: $tunActive)")
         }
+
+        VpnLogManager.log(LogLevel.CONN, "PROTECT", "[PROTECT] Upstream socket successfully protected from VPN routing loop")
 
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 25000
@@ -406,7 +422,9 @@ class SshTunnelClient(
 
         val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
         val sslSocket = sslFactory.createSocket(rawSocket, serverHost, serverPort, true) as SSLSocket
-        vpnService.protect(sslSocket)
+        try {
+            socketProtector.protect(sslSocket)
+        } catch (_: Exception) {}
 
         if (cleanSni.isNotBlank()) {
             val sslParams = SSLParameters().apply {

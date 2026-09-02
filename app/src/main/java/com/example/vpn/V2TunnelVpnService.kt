@@ -16,6 +16,7 @@ import com.example.model.VpnConnectionState
 import com.example.model.VpnProfile
 import com.example.model.VpnProtocol
 import com.example.vpn.backend.ITunnelBackend
+import com.example.vpn.backend.UpstreamSocketProtector
 import com.example.vpn.backend.VpnBackendDispatcher
 import com.example.vpn.socks.LocalSocksServer
 import com.example.vpn.tun2socks.TunPacketRouter
@@ -27,12 +28,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicBoolean
 
-class V2TunnelVpnService : VpnService() {
+class V2TunnelVpnService : VpnService(), UpstreamSocketProtector {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO)
@@ -45,6 +47,79 @@ class V2TunnelVpnService : VpnService() {
     private var activeBackend: ITunnelBackend? = null
     private var socksServer: LocalSocksServer? = null
     private var packetRouter: TunPacketRouter? = null
+
+    override fun isVpnInterfaceActive(): Boolean = vpnInterface != null
+
+    override fun protect(socket: Socket): Boolean {
+        val threadName = Thread.currentThread().name
+        val tunActive = isVpnInterfaceActive()
+        val isConnected = socket.isConnected
+        val isBound = socket.isBound
+        val isClosed = socket.isClosed
+        val localAddr = try { socket.localSocketAddress?.toString() } catch (_: Exception) { "unknown" }
+        val remoteAddr = try { socket.remoteSocketAddress?.toString() } catch (_: Exception) { "unconnected" }
+        val socketClass = socket.javaClass.name
+
+        VpnLogManager.log(
+            LogLevel.CONN,
+            "PROTECT",
+            "[PROTECT BEFORE] socketClass=$socketClass, isConnected=$isConnected, isBound=$isBound, isClosed=$isClosed, local=$localAddr, remote=$remoteAddr, thread=$threadName, tunActive=$tunActive"
+        )
+
+        return try {
+            val result = super<VpnService>.protect(socket)
+            VpnLogManager.log(
+                if (result) LogLevel.INFO else LogLevel.ERROR,
+                "PROTECT",
+                "[PROTECT AFTER] result=$result, socketClass=$socketClass, tunActive=$tunActive"
+            )
+            result
+        } catch (e: Exception) {
+            val excClass = e.javaClass.name
+            val excMsg = e.message ?: "Unknown error"
+            VpnLogManager.log(
+                LogLevel.ERROR,
+                "PROTECT",
+                "[PROTECT EXCEPTION] exception=$excClass: $excMsg, socketClass=$socketClass, tunActive=$tunActive"
+            )
+            false
+        }
+    }
+
+    override fun protect(socket: DatagramSocket): Boolean {
+        val threadName = Thread.currentThread().name
+        val tunActive = isVpnInterfaceActive()
+        val isConnected = socket.isConnected
+        val isBound = socket.isBound
+        val isClosed = socket.isClosed
+        val localAddr = try { socket.localSocketAddress?.toString() } catch (_: Exception) { "unknown" }
+        val socketClass = socket.javaClass.name
+
+        VpnLogManager.log(
+            LogLevel.CONN,
+            "PROTECT",
+            "[PROTECT UDP BEFORE] socketClass=$socketClass, isConnected=$isConnected, isBound=$isBound, isClosed=$isClosed, local=$localAddr, thread=$threadName, tunActive=$tunActive"
+        )
+
+        return try {
+            val result = super<VpnService>.protect(socket)
+            VpnLogManager.log(
+                if (result) LogLevel.INFO else LogLevel.ERROR,
+                "PROTECT",
+                "[PROTECT UDP AFTER] result=$result, socketClass=$socketClass, tunActive=$tunActive"
+            )
+            result
+        } catch (e: Exception) {
+            val excClass = e.javaClass.name
+            val excMsg = e.message ?: "Unknown error"
+            VpnLogManager.log(
+                LogLevel.ERROR,
+                "PROTECT",
+                "[PROTECT UDP EXCEPTION] exception=$excClass: $excMsg, socketClass=$socketClass, tunActive=$tunActive"
+            )
+            false
+        }
+    }
 
     companion object {
         const val ACTION_CONNECT = "com.example.vpn.CONNECT"
@@ -202,29 +277,7 @@ class V2TunnelVpnService : VpnService() {
                 VpnLogManager.log(LogLevel.INFO, "XRay CONFIG", "[XRay CONFIG] Generated Xray VMess JSON configuration for ${profile.server}:${profile.port}")
             }
 
-            // 3. Dispatch to the dedicated protocol backend (SSH, VMess, VLESS, Trojan, SS, SOCKS5)
-            val backend = VpnBackendDispatcher.dispatch(this@V2TunnelVpnService, profile)
-            activeBackend = backend
-
-            // 4. Start Local SOCKS listener on 127.0.0.1:10808 with active backend
-            val socks = LocalSocksServer(this@V2TunnelVpnService, backend, port = 10808)
-            val socksStarted = socks.start()
-            if (!socksStarted) {
-                throw IllegalStateException("Failed to bind SOCKS5 listener on 127.0.0.1:10808")
-            }
-            socksServer = socks
-            VpnLogManager.log(LogLevel.INFO, "SOCKS5", "[SOCKS5] 127.0.0.1:10808 ready for Tun2Socks traffic")
-
-            // 5. Perform protocol-specific handshake verification
-            val handshakeResult = backend.verifyHandshake()
-            if (handshakeResult.isFailure) {
-                val error = handshakeResult.exceptionOrNull()
-                val errorMsg = error?.localizedMessage ?: "Handshake error"
-                VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] ${backend.backendName} handshake failed: $errorMsg")
-                throw error ?: RuntimeException(errorMsg)
-            }
-
-            // 6. Establish Android TUN interface with IPv4 + IPv6 leak protection
+            // 3. Establish Android TUN interface FIRST so VpnService.protect() is recognized by the OS
             VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] Establishing Android TUN interface...")
             val builder = Builder()
                 .setSession("V2Tunnel: ${profile.protocol.displayName}")
@@ -242,6 +295,28 @@ class V2TunnelVpnService : VpnService() {
 
             vpnInterface = vpnPfd
             VpnLogManager.log(LogLevel.INFO, "TUN START", "[TUN START] TUN interface active (MTU: 1500, IPv4: 10.8.0.2/24, IPv6: fd00::2/120)")
+
+            // 4. Dispatch to the dedicated protocol backend (SSH, VMess, VLESS, Trojan, SS, SOCKS5)
+            val backend = VpnBackendDispatcher.dispatch(this@V2TunnelVpnService, profile)
+            activeBackend = backend
+
+            // 5. Start Local SOCKS listener on 127.0.0.1:10808 with active backend
+            val socks = LocalSocksServer(this@V2TunnelVpnService, backend, port = 10808)
+            val socksStarted = socks.start()
+            if (!socksStarted) {
+                throw IllegalStateException("Failed to bind SOCKS5 listener on 127.0.0.1:10808")
+            }
+            socksServer = socks
+            VpnLogManager.log(LogLevel.INFO, "SOCKS5", "[SOCKS5] 127.0.0.1:10808 ready for Tun2Socks traffic")
+
+            // 6. Perform protocol-specific handshake verification (Upstream socket protected with active TUN)
+            val handshakeResult = backend.verifyHandshake()
+            if (handshakeResult.isFailure) {
+                val error = handshakeResult.exceptionOrNull()
+                val errorMsg = error?.localizedMessage ?: "Handshake error"
+                VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] ${backend.backendName} handshake failed: $errorMsg")
+                throw error ?: RuntimeException(errorMsg)
+            }
 
             // 7. Forward TUN traffic through Tun2Socks -> SOCKS:10808 -> Backend
             val router = TunPacketRouter(

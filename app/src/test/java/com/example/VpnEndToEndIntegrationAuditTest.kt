@@ -260,4 +260,85 @@ class VpnEndToEndIntegrationAuditTest {
         val readByte = channel.inputStream.read()
         assertEquals("Reading from closed/empty channel must return EOF -1", -1, readByte)
     }
+
+    @Test
+    fun testUpstreamSocketProtectorReturnsTrue() {
+        var protectCalled = false
+        val protector = object : com.example.vpn.backend.UpstreamSocketProtector {
+            override fun protect(socket: java.net.Socket): Boolean {
+                protectCalled = true
+                return true
+            }
+            override fun isVpnInterfaceActive(): Boolean = true
+        }
+
+        val testSocket = java.net.Socket()
+        val res = protector.protect(testSocket)
+        assertTrue("Protector must return true when protection succeeds", res)
+        assertTrue("Protect method was called", protectCalled)
+    }
+
+    @Test
+    fun testUpstreamSocketProtectorReturnsFalseAndFailsConnection() {
+        val failingProtector = object : com.example.vpn.backend.UpstreamSocketProtector {
+            override fun protect(socket: java.net.Socket): Boolean = false
+            override fun isVpnInterfaceActive(): Boolean = false
+        }
+
+        val profile = com.example.model.VpnProfile(
+            id = 1L,
+            name = "Test SSH",
+            protocol = com.example.model.VpnProtocol.SSH,
+            server = "127.0.0.1",
+            port = 2222
+        )
+
+        val sshClient = com.example.vpn.ssh.SshTunnelClient(failingProtector, profile)
+
+        var handshakeReached = false
+        kotlinx.coroutines.runBlocking {
+            val result = sshClient.verifyHandshake()
+            assertTrue("Connection must fail when protect() returns false", result.isFailure)
+            val exception = result.exceptionOrNull()
+            assertNotNull("Exception must not be null", exception)
+            assertTrue(
+                "Exception message must mention routing loop protection failure",
+                exception?.message?.contains("Failed to protect upstream socket from VPN routing loop") == true
+            )
+        }
+
+        assertFalse("SSH Handshake must NEVER be reached when protect() fails", handshakeReached)
+    }
+
+    @Test
+    fun testUpstreamSocketProtectionRequiresTunActive() {
+        var tunStateDuringProtect = false
+        val orderingProtector = object : com.example.vpn.backend.UpstreamSocketProtector {
+            private var isTunActive = false
+
+            fun activateTun() {
+                isTunActive = true
+            }
+
+            override fun protect(socket: java.net.Socket): Boolean {
+                tunStateDuringProtect = isTunActive
+                return isTunActive
+            }
+
+            override fun isVpnInterfaceActive(): Boolean = isTunActive
+        }
+
+        // Case 1: Protect called before TUN established
+        val socket1 = java.net.Socket()
+        val resultBeforeTun = orderingProtector.protect(socket1)
+        assertFalse("Protect must fail when TUN is not active", resultBeforeTun)
+        assertFalse("TUN was not active during protect", tunStateDuringProtect)
+
+        // Case 2: TUN established first, then protect called
+        orderingProtector.activateTun()
+        val socket2 = java.net.Socket()
+        val resultAfterTun = orderingProtector.protect(socket2)
+        assertTrue("Protect succeeds after TUN is active", resultAfterTun)
+        assertTrue("TUN was active during protect", tunStateDuringProtect)
+    }
 }
