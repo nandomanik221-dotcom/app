@@ -479,37 +479,53 @@ class SshTunnelClient(
 
     /**
      * Real end-to-end connectivity verification via an active direct-tcpip channel.
+     * Throws an exception if all probe destinations fail, preventing isTunnelReady from becoming true.
      */
     private fun verifyEndToEndConnectivity(session: Session) {
-        try {
-            val verifyChannel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
-            verifyChannel.setHost("1.1.1.1")
-            verifyChannel.setPort(80)
-            verifyChannel.setOrgIPAddress("127.0.0.1")
-            verifyChannel.setOrgPort(0)
-            verifyChannel.connect(10000)
+        val probeTargets = listOf(
+            Pair("1.1.1.1", 80),
+            Pair("1.0.0.1", 80),
+            Pair("8.8.8.8", 80)
+        )
 
-            val vOut = verifyChannel.outputStream
-            val vIn = verifyChannel.inputStream
+        var lastError: Exception? = null
+        for ((host, port) in probeTargets) {
+            var verifyChannel: ChannelDirectTCPIP? = null
+            try {
+                verifyChannel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
+                verifyChannel.setHost(host)
+                verifyChannel.setPort(port)
+                verifyChannel.setOrgIPAddress("127.0.0.1")
+                verifyChannel.setOrgPort(0)
+                verifyChannel.connect(7000)
 
-            val testReq = "HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"
-            vOut.write(testReq.toByteArray(StandardCharsets.US_ASCII))
-            vOut.flush()
+                val vOut = verifyChannel.outputStream
+                val vIn = verifyChannel.inputStream
 
-            val respLine = readLine(vIn)
-            val code = HttpStatusParser.parseStatusCode(respLine)
+                val testReq = "HEAD / HTTP/1.1\r\nHost: $host\r\nUser-Agent: V2TunnelProbe/1.0\r\nConnection: close\r\n\r\n"
+                vOut.write(testReq.toByteArray(StandardCharsets.US_ASCII))
+                vOut.flush()
 
-            verifyChannel.disconnect()
+                val respLine = readLine(vIn)
+                val code = HttpStatusParser.parseStatusCode(respLine)
 
-            if (code != null) {
-                VpnLogManager.log(LogLevel.INFO, "VERIFY", "[VERIFY] Real end-to-end connectivity verified (HTTP $code)")
-            } else {
-                VpnLogManager.log(LogLevel.INFO, "VERIFY", "[VERIFY] Direct-tcpip channel opened and responsive")
+                if (code != null && code in 100..599) {
+                    VpnLogManager.log(LogLevel.INFO, "VERIFY", "[VERIFY] Real end-to-end connectivity verified via $host:$port (HTTP $code)")
+                    return
+                } else {
+                    throw IllegalStateException("Invalid HTTP response line from probe $host:$port: $respLine")
+                }
+            } catch (e: Exception) {
+                lastError = e
+                VpnLogManager.log(LogLevel.WARN, "VERIFY", "[VERIFY] End-to-end probe $host:$port failed: ${e.message}")
+            } finally {
+                try {
+                    verifyChannel?.disconnect()
+                } catch (_: Exception) {}
             }
-        } catch (e: Exception) {
-            // If probe host is blocked or unreachable, session itself is still authenticated
-            VpnLogManager.log(LogLevel.WARN, "VERIFY", "[VERIFY] End-to-end probe note: ${e.message}")
         }
+
+        throw IllegalStateException("Direct-TCPIP end-to-end probe failed for all targets. Last error: ${lastError?.message}", lastError)
     }
 
     /**

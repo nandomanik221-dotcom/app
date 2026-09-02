@@ -29,6 +29,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicBoolean
 
 class V2TunnelVpnService : VpnService() {
@@ -273,6 +274,7 @@ class V2TunnelVpnService : VpnService() {
         } catch (e: Exception) {
             val failureMessage = e.localizedMessage ?: e.javaClass.simpleName
             VpnLogManager.log(LogLevel.ERROR, "ERROR", "[ERROR] Connection attempt failed: $failureMessage")
+            cleanupResources()
             false
         }
     }
@@ -308,49 +310,90 @@ class V2TunnelVpnService : VpnService() {
     }
 
     private suspend fun runConnectivityTests(socks: LocalSocksServer, backend: ITunnelBackend): Boolean = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val sock = Socket()
-            sock.soTimeout = 6000
-            sock.connect(InetSocketAddress("127.0.0.1", socks.port), 3000)
+        val probeTargets = listOf(
+            Pair("1.1.1.1", 80),
+            Pair("1.0.0.1", 80),
+            Pair("8.8.8.8", 80)
+        )
 
-            val out = sock.getOutputStream()
-            val inStream = sock.getInputStream()
+        for ((targetHost, targetPort) in probeTargets) {
+            var sock: Socket? = null
+            try {
+                sock = Socket()
+                sock.soTimeout = 6000
+                sock.connect(InetSocketAddress("127.0.0.1", socks.port), 3000)
 
-            // SOCKS5 Handshake: NO_AUTH
-            out.write(byteArrayOf(0x05, 0x01, 0x00))
-            out.flush()
+                val out = sock.getOutputStream()
+                val inStream = sock.getInputStream()
 
-            val ver = inStream.read()
-            val method = inStream.read()
-            if (ver != 5 || method != 0) {
+                // SOCKS5 Handshake: NO_AUTH
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+
+                val ver = inStream.read()
+                val method = inStream.read()
+                if (ver != 5 || method != 0) {
+                    sock.close()
+                    continue
+                }
+
+                // SOCKS5 CONNECT request
+                val hostBytes = targetHost.split(".").map { it.toInt().toByte() }
+                val connectReq = byteArrayOf(
+                    0x05, 0x01, 0x00, 0x01,
+                    hostBytes[0], hostBytes[1], hostBytes[2], hostBytes[3],
+                    ((targetPort shr 8) and 0xFF).toByte(),
+                    (targetPort and 0xFF).toByte()
+                )
+                out.write(connectReq)
+                out.flush()
+
+                val resp = ByteArray(10)
+                var totalRead = 0
+                while (totalRead < 10) {
+                    val n = inStream.read(resp, totalRead, 10 - totalRead)
+                    if (n == -1) break
+                    totalRead += n
+                }
+
+                if (totalRead < 10 || resp[1] != 0x00.toByte()) {
+                    sock.close()
+                    continue
+                }
+
+                // Send real HTTP HEAD request through SOCKS5 tunnel
+                val testReq = "HEAD / HTTP/1.1\r\nHost: $targetHost\r\nUser-Agent: V2TunnelProbe/1.0\r\nConnection: close\r\n\r\n"
+                out.write(testReq.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+
+                val sb = StringBuilder()
+                var b: Int
+                while (inStream.read().also { b = it } != -1) {
+                    if (b == '\n'.code) break
+                    if (b != '\r'.code) {
+                        sb.append(b.toChar())
+                    }
+                }
+                val statusLine = sb.toString()
+                val statusCode = com.example.vpn.util.HttpStatusParser.parseStatusCode(statusLine)
+
                 sock.close()
-                return@withContext false
+
+                if (statusCode != null && statusCode in 100..599) {
+                    VpnLogManager.log(LogLevel.INFO, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Tunnel verified via $targetHost:$targetPort (HTTP $statusCode)")
+                    return@withContext true
+                }
+            } catch (e: Exception) {
+                VpnLogManager.log(LogLevel.WARN, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Target $targetHost:$targetPort probe failed: ${e.message}")
+            } finally {
+                try {
+                    sock?.close()
+                } catch (_: Exception) {}
             }
-
-            // SOCKS5 CONNECT to 1.1.1.1:80 through backend
-            val connectReq = byteArrayOf(
-                0x05, 0x01, 0x00, 0x01,
-                1, 1, 1, 1,
-                0x00, 0x50
-            )
-            out.write(connectReq)
-            out.flush()
-
-            val resp = ByteArray(10)
-            var totalRead = 0
-            while (totalRead < 10) {
-                val n = inStream.read(resp, totalRead, 10 - totalRead)
-                if (n == -1) break
-                totalRead += n
-            }
-
-            val success = totalRead >= 10 && resp[1] == 0x00.toByte()
-            sock.close()
-            success
-        } catch (e: Exception) {
-            VpnLogManager.log(LogLevel.WARN, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] Tunnel probe note: ${e.message}")
-            true
         }
+
+        VpnLogManager.log(LogLevel.ERROR, "CONNECTIVITY TEST", "[CONNECTIVITY TEST] All tunnel connectivity probes failed.")
+        return@withContext false
     }
 
     private fun startMetricsLoop(

@@ -7,6 +7,8 @@ import com.example.vpn.util.SniUtils
 import com.jcraft.jsch.TestDirectTcpIpChannel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -184,5 +186,78 @@ class VpnEndToEndIntegrationAuditTest {
         assertEquals("google.com", SniUtils.sanitizeSni("wss://google.com:8443", "1.1.1.1"))
         assertEquals("fallback.com", SniUtils.sanitizeSni("", "fallback.com"))
         assertEquals("fallback.com", SniUtils.sanitizeSni("   ", "fallback.com"))
+    }
+
+    @Test
+    fun testProbeSuccessWithValidHttp2xx3xx() {
+        val valid200 = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        val code200 = HttpStatusParser.parseStatusCode(valid200.lines().first())
+        assertNotNull(code200)
+        assertTrue(code200 in 100..599)
+        assertEquals(200, code200)
+
+        val valid301 = "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com\r\n\r\n"
+        val code301 = HttpStatusParser.parseStatusCode(valid301.lines().first())
+        assertNotNull(code301)
+        assertTrue(code301 in 100..599)
+        assertEquals(301, code301)
+    }
+
+    @Test
+    fun testProbeFailureWithInvalidHttpResponse() {
+        val invalidGarbage = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n"
+        val codeGarbage = HttpStatusParser.parseStatusCode(invalidGarbage)
+        org.junit.Assert.assertNull("Non-HTTP response must return null status code", codeGarbage)
+
+        val emptyLine = ""
+        val codeEmpty = HttpStatusParser.parseStatusCode(emptyLine)
+        org.junit.Assert.assertNull("Empty line must return null status code", codeEmpty)
+    }
+
+    @Test
+    fun testProbeDirectTcpIpChannelStreamInteraction() {
+        val mockResponse = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        val channelIn = ByteArrayInputStream(mockResponse)
+        val channelOut = ByteArrayOutputStream()
+        val channel = TestDirectTcpIpChannel(channelIn, channelOut)
+
+        assertTrue(channel.isConnected)
+        val out = channel.outputStream
+        val inStream = channel.inputStream
+
+        val req = "HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"
+        out.write(req.toByteArray(StandardCharsets.US_ASCII))
+        out.flush()
+
+        val sb = StringBuilder()
+        var b: Int
+        while (inStream.read().also { b = it } != -1) {
+            if (b == '\n'.code) break
+            if (b != '\r'.code) {
+                sb.append(b.toChar())
+            }
+        }
+        val statusLine = sb.toString()
+        val code = HttpStatusParser.parseStatusCode(statusLine)
+
+        channel.disconnect()
+        assertTrue(channel.isClosed)
+        assertEquals(204, code)
+        assertTrue("Request sent matches HTTP format", channelOut.toString(StandardCharsets.US_ASCII.name()).startsWith("HEAD / HTTP/1.1"))
+    }
+
+    @Test
+    fun testProbeChannelFailureHandling() {
+        // Channel disconnected / EOF immediately
+        val emptyIn = ByteArrayInputStream(ByteArray(0))
+        val emptyOut = ByteArrayOutputStream()
+        val channel = TestDirectTcpIpChannel(emptyIn, emptyOut)
+        channel.disconnect()
+
+        assertFalse("Disconnected channel is not connected", channel.isConnected)
+        assertTrue("Disconnected channel is closed", channel.isClosed)
+
+        val readByte = channel.inputStream.read()
+        assertEquals("Reading from closed/empty channel must return EOF -1", -1, readByte)
     }
 }
