@@ -74,9 +74,16 @@ object HttpStatusParser {
         val headers = mutableMapOf<String, String>()
 
         // Read all headers until empty line
+        var headerEndFound = false
         while (true) {
-            val line = readLine(inStream) ?: break
-            if (line.isBlank()) break
+            val line = readLine(inStream)
+            if (line == null) {
+                break
+            }
+            if (line.isBlank()) {
+                headerEndFound = true
+                break
+            }
             val colonIdx = line.indexOf(':')
             if (colonIdx > 0) {
                 val name = line.substring(0, colonIdx).trim().lowercase(Locale.ROOT)
@@ -85,10 +92,19 @@ object HttpStatusParser {
             }
         }
 
-        var bodyLength = 0
+        if (!headerEndFound && headers.isEmpty() && statusCode == null) {
+            return null
+        }
 
-        // If status is 101, 204, 304, or 1xx/2xx CONNECT, there is no body
-        val isNoBodyStatus = statusCode == 101 || statusCode == 204 || statusCode == 304 || (statusCode != null && statusCode in 100..199)
+        var bodyLength = 0
+        var isComplete = true
+
+        // RFC 7230 §3.3.3: 1xx, 204, 304, and 2xx CONNECT responses have no body
+        val isNoBodyStatus = statusCode == 101 ||
+                statusCode == 204 ||
+                statusCode == 304 ||
+                (statusCode != null && statusCode in 100..199) ||
+                (statusCode == 200 && statusLine.contains("Connection established", ignoreCase = true))
 
         if (!isNoBodyStatus) {
             val contentLengthStr = headers["content-length"]
@@ -99,12 +115,19 @@ object HttpStatusParser {
                 if (len > 0) {
                     val consumed = inStream.readNBytesCompat(len)
                     bodyLength = consumed.size
+                    if (consumed.size < len) {
+                        isComplete = false
+                    }
                 }
             } else if (transferEncoding?.contains("chunked") == true) {
                 // Chunked transfer encoding consumption
                 while (true) {
-                    val sizeLine = readLine(inStream) ?: break
-                    val chunkSize = sizeLine.trim().split(";")[0].toIntOrNull(16) ?: 0
+                    val sizeLine = readLine(inStream)
+                    if (sizeLine == null) {
+                        isComplete = false
+                        break
+                    }
+                    val chunkSize = sizeLine.trim().split(";")[0].trim().toIntOrNull(16) ?: 0
                     if (chunkSize <= 0) {
                         // Trailing headers until blank line
                         while (true) {
@@ -115,6 +138,10 @@ object HttpStatusParser {
                     }
                     val chunkData = inStream.readNBytesCompat(chunkSize)
                     bodyLength += chunkData.size
+                    if (chunkData.size < chunkSize) {
+                        isComplete = false
+                        break
+                    }
                     // Consume trailing CRLF of chunk
                     readLine(inStream)
                 }
@@ -125,7 +152,8 @@ object HttpStatusParser {
             statusLine = statusLine,
             statusCode = statusCode,
             headers = headers,
-            bodyLength = bodyLength
+            bodyLength = bodyLength,
+            isComplete = isComplete
         )
     }
 
@@ -147,6 +175,7 @@ object HttpStatusParser {
     }
 
     private fun InputStream.readNBytesCompat(n: Int): ByteArray {
+        if (n <= 0) return ByteArray(0)
         val buf = ByteArray(n)
         var total = 0
         while (total < n) {
@@ -162,7 +191,8 @@ data class ParsedHttpResponse(
     val statusLine: String,
     val statusCode: Int?,
     val headers: Map<String, String>,
-    val bodyLength: Int
+    val bodyLength: Int,
+    val isComplete: Boolean = true
 )
 
 enum class PayloadMode {

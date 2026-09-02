@@ -439,4 +439,103 @@ class VpnEndToEndIntegrationAuditTest {
         val remaining = inStream.readBytes()
         assertEquals("NEXT_DATA", String(remaining, java.nio.charset.StandardCharsets.UTF_8))
     }
+
+    @Test
+    fun testRealDeviceFailurePattern403WithHtmlThen200Then101ThenSsh() {
+        // Exact real-device sequence: 403 Forbidden with Content-Length HTML, then 200 Connection established, then 101 Switching Protocols, then SSH banner
+        val htmlBody = "<html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>"
+        val stage1 = "HTTP/1.1 403 Forbidden\r\nServer: cloudflare\r\nContent-Type: text/html\r\nContent-Length: ${htmlBody.length}\r\n\r\n$htmlBody"
+        val stage2 = "HTTP/1.0 200 Connection established\r\n\r\n"
+        val stage3 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+        val sshBanner = "SSH-2.0-test-server_1.0\r\n"
+        val fullStream = stage1 + stage2 + stage3 + sshBanner
+
+        val inStream = java.io.ByteArrayInputStream(fullStream.toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+
+        // Step 1: Consume 403 Forbidden + Body
+        val resp1 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp1)
+        assertEquals(403, resp1?.statusCode)
+        assertEquals(htmlBody.length, resp1?.bodyLength)
+        assertTrue(resp1?.isComplete == true)
+
+        // Step 2: Consume 200 Connection established (no body)
+        val resp2 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp2)
+        assertEquals(200, resp2?.statusCode)
+        assertEquals(0, resp2?.bodyLength)
+
+        // Step 3: Consume 101 Switching Protocols (no body)
+        val resp3 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp3)
+        assertEquals(101, resp3?.statusCode)
+        assertEquals(0, resp3?.bodyLength)
+
+        // Step 4: Verify remaining stream is cleanly positioned at the SSH banner
+        val remaining = inStream.readBytes()
+        val remainingText = String(remaining, java.nio.charset.StandardCharsets.UTF_8)
+        assertEquals(sshBanner, remainingText)
+    }
+
+    @Test
+    fun testChunkedHtmlBodyFollowedByNextResponse() {
+        val chunk1 = "<div>Access Blocked by Proxy</div>"
+        val chunkedStage = "HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\nContent-Type: text/html\r\n\r\n${Integer.toHexString(chunk1.length)}\r\n$chunk1\r\n0\r\n\r\n"
+        val wsUpgradeStage = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        val sshBanner = "SSH-2.0-OpenSSH_9.0\r\n"
+
+        val inStream = java.io.ByteArrayInputStream((chunkedStage + wsUpgradeStage + sshBanner).toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+
+        val resp1 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp1)
+        assertEquals(403, resp1?.statusCode)
+        assertEquals(chunk1.length, resp1?.bodyLength)
+        assertTrue(resp1?.isComplete == true)
+
+        val resp2 = HttpStatusParser.consumeSingleResponse(inStream)
+        assertNotNull(resp2)
+        assertEquals(101, resp2?.statusCode)
+
+        val remaining = inStream.readBytes()
+        assertEquals(sshBanner, String(remaining, java.nio.charset.StandardCharsets.UTF_8))
+    }
+
+    @Test
+    fun testWebSocketFramedSocketDoesNotConsumeOrInterpretHttpBody() {
+        // Verify that WebSocketFramedSocket operates strictly on framed binary payloads and does not perform HTTP parsing
+        val mockRawIn = java.io.ByteArrayOutputStream()
+        // Create a server-to-client unmasked binary frame (Opcode 0x02, length 19: "SSH-2.0-OpenSSH_8.9")
+        val payload = "SSH-2.0-OpenSSH_8.9".toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+        mockRawIn.write(byteArrayOf(0x82.toByte(), payload.size.toByte()))
+        mockRawIn.write(payload)
+
+        val inStream = java.io.ByteArrayInputStream(mockRawIn.toByteArray())
+        val outStream = java.io.ByteArrayOutputStream()
+
+        val mockSocket = object : java.net.Socket() {
+            override fun getInputStream(): java.io.InputStream = inStream
+            override fun getOutputStream(): java.io.OutputStream = outStream
+            override fun isConnected(): Boolean = true
+            override fun isClosed(): Boolean = false
+        }
+
+        val wsSocket = com.example.vpn.ssh.WebSocketFramedSocket(mockSocket)
+
+        // Read through framed socket - should deliver pure payload bytes
+        val readBuf = ByteArray(50)
+        val readBytes = wsSocket.getInputStream().read(readBuf)
+        assertEquals(payload.size, readBytes)
+        val receivedStr = String(readBuf, 0, readBytes, java.nio.charset.StandardCharsets.UTF_8)
+        assertEquals("SSH-2.0-OpenSSH_8.9", receivedStr)
+
+        // Write through framed socket - should produce RFC 6455 masked binary frame
+        val clientData = "SSH-2.0-Client_1.0\r\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+        wsSocket.getOutputStream().write(clientData)
+        wsSocket.getOutputStream().flush()
+
+        val writtenBytes = outStream.toByteArray()
+        assertTrue(writtenBytes.size > clientData.size) // header + 4 byte mask + masked payload
+        assertEquals(0x82.toByte(), writtenBytes[0]) // FIN=1, Opcode=2 (binary)
+        assertTrue((writtenBytes[1].toInt() and 0x80) != 0) // Mask bit set
+    }
 }

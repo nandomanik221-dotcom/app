@@ -111,6 +111,7 @@ class SshTunnelClient(
             session.setConfig("compression.c2s", "zlib@openssh.com,zlib,none")
             session.serverAliveInterval = 30000
 
+            VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] handing clean stream to JSch")
             VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Memulai KEX & negosiasi kunci enkripsi...")
 
             // 3. Connect real SSH session (performs actual identification exchange, KEX, and authentication)
@@ -521,6 +522,9 @@ class SshTunnelClient(
                     ?: throw IllegalStateException("Remote endpoint closed connection immediately after payload injection")
 
                 VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${firstResp.statusLine}")
+                val cl1 = firstResp.headers["content-length"] ?: "none"
+                val te1 = firstResp.headers["transfer-encoding"] ?: "none"
+                VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Content-Length: $cl1, Transfer-Encoding: $te1, Body drained: ${firstResp.bodyLength} bytes")
 
                 if (firstResp.statusCode != 101) {
                     VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
@@ -541,6 +545,9 @@ class SshTunnelClient(
                         val secondResp = HttpStatusParser.consumeSingleResponse(inStream)
                         if (secondResp != null) {
                             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${secondResp.statusLine}")
+                            val cl2 = secondResp.headers["content-length"] ?: "none"
+                            val te2 = secondResp.headers["transfer-encoding"] ?: "none"
+                            VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Content-Length: $cl2, Transfer-Encoding: $te2, Body drained: ${secondResp.bodyLength} bytes")
                             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
                             VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] HTTP/1.0 200 Connection established")
                         }
@@ -554,6 +561,9 @@ class SshTunnelClient(
                 val resp = HttpStatusParser.consumeSingleResponse(inStream)
                 if (resp != null) {
                     VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] ${resp.statusLine}")
+                    val cl = resp.headers["content-length"] ?: "none"
+                    val te = resp.headers["transfer-encoding"] ?: "none"
+                    VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Content-Length: $cl, Transfer-Encoding: $te, Body drained: ${resp.bodyLength} bytes")
                     if (resp.statusCode != 200) {
                         VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] Ganti respons")
                         VpnLogManager.log(LogLevel.CONN, "HTTP", "[HTTP] HTTP/1.0 200 Connection established")
