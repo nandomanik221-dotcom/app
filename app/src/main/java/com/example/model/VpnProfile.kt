@@ -1,5 +1,23 @@
 package com.example.model
 
+import java.util.Locale
+
+enum class SshTransport(val displayName: String) {
+    STANDARD("Standard"),
+    HCR("HCR"),
+    WEBSOCKET("WebSocket");
+
+    companion object {
+        fun fromString(value: String?): SshTransport {
+            return when (value?.trim()?.uppercase(Locale.ROOT)) {
+                "WEBSOCKET", "WS" -> WEBSOCKET
+                "HCR" -> HCR
+                else -> STANDARD
+            }
+        }
+    }
+}
+
 data class VpnProfile(
     val id: Long = 0L,
     val name: String,
@@ -20,6 +38,7 @@ data class VpnProfile(
     val sshPassword: String = "",
     val sshPayload: String = "",         // Custom HTTP / WebSocket payload
     val sshDirectSsl: Boolean = true,
+    val sshTransport: String = SshTransport.STANDARD.name, // "STANDARD", "HCR", "WEBSOCKET"
 
     // Remote Proxy ("Proxy Jarak Jauh") Configuration
     val remoteProxyEnabled: Boolean = false,
@@ -62,6 +81,15 @@ data class VpnProfile(
     val effectiveSshPassword: String
         get() = sshPassword.ifBlank { password }
 
+    val effectiveSshTransport: SshTransport
+        get() = SshTransport.fromString(sshTransport)
+
+    val isSshWebSocket: Boolean
+        get() = protocol == VpnProtocol.SSH && effectiveSshTransport == SshTransport.WEBSOCKET
+
+    val isSshStandard: Boolean
+        get() = protocol == VpnProtocol.SSH && effectiveSshTransport != SshTransport.WEBSOCKET
+
     val displayFlag: String
         get() = when (countryCode.uppercase()) {
             "SG" -> "🇸🇬"
@@ -97,6 +125,7 @@ data class VpnProfile(
                 append(security.uppercase())
             }
             if (protocol == VpnProtocol.SSH) {
+                append(" • ${effectiveSshTransport.displayName}")
                 if (sshDirectSsl) append(" • SSL/TLS") else append(" • Direct")
                 if (remoteProxyEnabled) append(" • Proxy ($remoteProxyType)")
                 if (sni.isNotBlank()) append(" • SNI")

@@ -27,6 +27,7 @@ data class VpnProfileEntity(
     val sshPassword: String = "",
     val sshPayload: String = "",
     val sshDirectSsl: Boolean = true,
+    val sshTransport: String = "STANDARD",
 
     // Remote Proxy fields
     val remoteProxyEnabled: Boolean = false,
@@ -66,6 +67,7 @@ data class VpnProfileEntity(
             sshPassword = sshPassword.ifBlank { effectivePassword },
             sshPayload = sshPayload,
             sshDirectSsl = sshDirectSsl,
+            sshTransport = sshTransport,
             remoteProxyEnabled = remoteProxyEnabled,
             remoteProxyType = remoteProxyType,
             remoteProxyHost = remoteProxyHost,
@@ -105,6 +107,7 @@ data class VpnProfileEntity(
                 sshPassword = domain.sshPassword.ifBlank { effectivePassword },
                 sshPayload = domain.sshPayload,
                 sshDirectSsl = domain.sshDirectSsl,
+                sshTransport = domain.sshTransport,
                 remoteProxyEnabled = domain.remoteProxyEnabled,
                 remoteProxyType = domain.remoteProxyType,
                 remoteProxyHost = domain.remoteProxyHost,

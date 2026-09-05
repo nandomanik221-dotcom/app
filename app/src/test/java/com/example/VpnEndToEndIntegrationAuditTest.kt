@@ -1,10 +1,10 @@
 package com.example
 
 import com.example.vpn.ssh.DirectTcpIpSocket
+import com.example.vpn.ssh.TestDirectTcpIpChannel
 import com.example.vpn.util.HttpStatusParser
 import com.example.vpn.util.PayloadMode
 import com.example.vpn.util.SniUtils
-import com.jcraft.jsch.TestDirectTcpIpChannel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -97,11 +97,13 @@ class VpnEndToEndIntegrationAuditTest {
         val testChannel = TestDirectTcpIpChannel(channelIn, channelOut)
 
         val directSocket = DirectTcpIpSocket(
-            channel = testChannel,
+            inStreamRaw = channelIn,
+            outStreamRaw = channelOut,
             targetHost = "example.com",
             targetPort = 80,
             totalBytesSent = totalSent,
-            totalBytesReceived = totalRecv
+            totalBytesReceived = totalRecv,
+            onClose = { testChannel.disconnect() }
         )
 
         assertTrue(directSocket.isConnected)
@@ -150,11 +152,13 @@ class VpnEndToEndIntegrationAuditTest {
                     )
 
                     val socket = DirectTcpIpSocket(
-                        channel = channel,
+                        inStreamRaw = channel.inStream,
+                        outStreamRaw = channel.outStream,
                         targetHost = "host-$i.test",
                         targetPort = 80 + i,
                         totalBytesSent = totalSent,
-                        totalBytesReceived = totalRecv
+                        totalBytesReceived = totalRecv,
+                        onClose = { channel.disconnect() }
                     )
 
                     val req = "Req-$i".toByteArray()
@@ -230,12 +234,13 @@ class VpnEndToEndIntegrationAuditTest {
         out.flush()
 
         val sb = StringBuilder()
-        var b: Int
-        while (inStream.read().also { b = it } != -1) {
+        var b = inStream.read()
+        while (b != -1) {
             if (b == '\n'.code) break
             if (b != '\r'.code) {
                 sb.append(b.toChar())
             }
+            b = inStream.read()
         }
         val statusLine = sb.toString()
         val code = HttpStatusParser.parseStatusCode(statusLine)
@@ -537,5 +542,114 @@ class VpnEndToEndIntegrationAuditTest {
         assertTrue(writtenBytes.size > clientData.size) // header + 4 byte mask + masked payload
         assertEquals(0x82.toByte(), writtenBytes[0]) // FIN=1, Opcode=2 (binary)
         assertTrue((writtenBytes[1].toInt() and 0x80) != 0) // Mask bit set
+    }
+
+    @Test
+    fun testExactRealDeviceFailurePatternMultiStageConsumption() {
+        // Exact real-device sequence:
+        // 1. HTTP/1.1 403 Forbidden with Content-Length N and HTML body
+        // 2. HTTP/1.0 200 Connection established
+        // 3. HTTP/1.1 101 Switching Protocols
+        // 4. SSH-2.0-test-server banner
+        val htmlBody = "<html><body><h1>403 Forbidden - Cloud CDN</h1></body></html>"
+        val stage1 = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: ${htmlBody.length}\r\n\r\n$htmlBody"
+        val stage2 = "HTTP/1.0 200 Connection established\r\nProxy-Agent: CloudProxy/1.0\r\n\r\n"
+        val stage3 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+        val sshBanner = "SSH-2.0-test-server\r\n"
+
+        val rawStreamData = (stage1 + stage2 + stage3 + sshBanner).toByteArray(StandardCharsets.UTF_8)
+        val inStream = ByteArrayInputStream(rawStreamData)
+        val pushbackIn = java.io.PushbackInputStream(inStream, 1024)
+
+        // Consume Stage 1: 403 Forbidden
+        val resp1 = HttpStatusParser.consumeSingleResponse(pushbackIn)
+        assertNotNull(resp1)
+        assertEquals(403, resp1?.statusCode)
+        assertEquals(htmlBody.length, resp1?.bodyLength)
+        assertTrue(resp1?.isComplete == true)
+
+        // Consume Stage 2: 200 Connection established
+        val resp2 = HttpStatusParser.consumeSingleResponse(pushbackIn)
+        assertNotNull(resp2)
+        assertEquals(200, resp2?.statusCode)
+        assertEquals(0, resp2?.bodyLength)
+
+        // Consume Stage 3: 101 Switching Protocols
+        val resp3 = HttpStatusParser.consumeSingleResponse(pushbackIn)
+        assertNotNull(resp3)
+        assertEquals(101, resp3?.statusCode)
+        assertEquals(0, resp3?.bodyLength)
+
+        // Verify remaining stream is exactly the raw SSH banner
+        val remainingBytes = pushbackIn.readBytes()
+        assertEquals(sshBanner, String(remainingBytes, StandardCharsets.UTF_8))
+    }
+
+    @Test
+    fun testRegressionFieldIndependenceGoldenConfig() {
+        // TASK 8 Regression Test:
+        // targetHost, targetPort, remoteProxyHost, remoteProxyPort, tlsSni, and httpHost
+        // must remain strictly independent.
+        val profile = com.example.model.VpnProfile(
+            name = "Golden Config Reference",
+            protocol = com.example.model.VpnProtocol.SSH,
+            server = "prem.nikuvpn.biz.id",
+            port = 443,
+            remoteProxyEnabled = true,
+            remoteProxyHost = "ads.ruangguru.com",
+            remoteProxyPort = 443,
+            remoteProxyType = "HTTP",
+            sni = "prem.nikuvpn.biz.id",
+            host = "ads.ruangguru.com",
+            sshPayload = "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]",
+            sshDirectSsl = true
+        )
+
+        // Verify target host and port
+        assertEquals("prem.nikuvpn.biz.id", profile.server)
+        assertEquals(443, profile.port)
+
+        // Verify remote proxy host and port
+        assertEquals("ads.ruangguru.com", profile.remoteProxyHost)
+        assertEquals(443, profile.remoteProxyPort)
+        assertTrue(profile.remoteProxyEnabled)
+
+        // Verify TLS SNI
+        assertEquals("prem.nikuvpn.biz.id", profile.sni)
+
+        // Verify HTTP Host header
+        assertEquals("ads.ruangguru.com", profile.host)
+
+        // Assert strictly distinct fields - SNI must NOT equal remote proxy host
+        // Target host must NOT equal remote proxy host
+        assertFalse("Target host must not automatically equal Remote Proxy host", profile.server == profile.remoteProxyHost)
+        assertFalse("TLS SNI must not automatically equal Remote Proxy host", profile.sni == profile.remoteProxyHost)
+        assertEquals("prem.nikuvpn.biz.id", profile.server)
+        assertEquals("prem.nikuvpn.biz.id", profile.sni)
+        assertEquals("ads.ruangguru.com", profile.remoteProxyHost)
+    }
+
+    @Test
+    fun testWebSocketFramedSocketExtendedLengthAndAvailable() {
+        // Verify 126 extended length (> 125 bytes)
+        val payload = ByteArray(300) { (it % 26 + 65).toByte() }
+        val mockOut = ByteArrayOutputStream()
+        mockOut.write(byteArrayOf(0x82.toByte(), 126.toByte(), (300 ushr 8).toByte(), (300 and 0xFF).toByte()))
+        mockOut.write(payload)
+
+        val inStream = ByteArrayInputStream(mockOut.toByteArray())
+        val mockSocket = object : java.net.Socket() {
+            override fun getInputStream(): java.io.InputStream = inStream
+            override fun getOutputStream(): java.io.OutputStream = ByteArrayOutputStream()
+            override fun isConnected(): Boolean = true
+            override fun isClosed(): Boolean = false
+        }
+
+        val wsSocket = com.example.vpn.ssh.WebSocketFramedSocket(mockSocket)
+        val readBuf = ByteArray(300)
+        val readCount = wsSocket.getInputStream().read(readBuf)
+
+        assertEquals(300, readCount)
+        assertEquals(payload.toList(), readBuf.toList())
     }
 }

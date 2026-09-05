@@ -1,5 +1,7 @@
 package com.example.vpn.ssh
 
+import com.example.model.LogLevel
+import com.example.vpn.VpnLogManager
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
@@ -13,10 +15,13 @@ import java.security.SecureRandom
  * and unwraps incoming WebSocket frames (Opcode 0x02, 0x01, 0x00, 0x09/0x0A Ping/Pong, 0x08 Close)
  * into a transparent raw byte stream for SSH / TCP tunneling.
  */
-class WebSocketFramedSocket(private val delegate: Socket) : Socket() {
+class WebSocketFramedSocket(
+    private val delegate: Socket,
+    customIn: InputStream? = null
+) : Socket() {
 
     private val random = SecureRandom()
-    private val framedIn = WebSocketInputStream(delegate.getInputStream(), delegate.getOutputStream(), random)
+    private val framedIn = WebSocketInputStream(customIn ?: delegate.getInputStream(), delegate.getOutputStream(), random)
     private val framedOut = WebSocketOutputStream(delegate.getOutputStream(), random)
 
     override fun getInputStream(): InputStream = framedIn
@@ -94,6 +99,12 @@ class WebSocketFramedSocket(private val delegate: Socket) : Socket() {
                 rawOut.write(maskedPayload)
                 rawOut.flush()
             }
+
+            VpnLogManager.log(
+                LogLevel.CONN,
+                "SSH STREAM",
+                "[SSH STREAM] direction=outbound bytes=$len transport=websocket ws_opcode=0x02 ws_fin=true frame_payload_length=$len"
+            )
         }
 
         fun sendClose() {
@@ -123,6 +134,10 @@ class WebSocketFramedSocket(private val delegate: Socket) : Socket() {
 
         private var buffer = ByteArray(0)
         private var bufferPos = 0
+
+        override fun available(): Int {
+            return (buffer.size - bufferPos) + rawIn.available()
+        }
 
         override fun read(): Int {
             val single = ByteArray(1)
@@ -155,6 +170,7 @@ class WebSocketFramedSocket(private val delegate: Socket) : Socket() {
                 if (b1 == -1) return null
 
                 val opcode = b0 and 0x0F
+                val fin = (b0 and 0x80) != 0
                 val isMasked = (b1 and 0x80) != 0
                 var payloadLen: Long = (b1 and 0x7F).toLong()
 
@@ -190,6 +206,11 @@ class WebSocketFramedSocket(private val delegate: Socket) : Socket() {
                 when (opcode) {
                     0x01, 0x02, 0x00 -> {
                         // Text, Binary, or Continuation frame
+                        VpnLogManager.log(
+                            LogLevel.CONN,
+                            "SSH STREAM",
+                            "[SSH STREAM] direction=inbound bytes=${payload.size} transport=websocket ws_opcode=0x%02X ws_fin=$fin frame_payload_length=${payload.size}".format(opcode)
+                        )
                         return payload
                     }
                     0x08 -> {

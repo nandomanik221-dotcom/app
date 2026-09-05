@@ -53,6 +53,7 @@ object NikuVpnProfileSerializer {
             // SSH specific fields
             put("sshDirectSsl", profile.sshDirectSsl)
             put("sshPayload", profile.sshPayload)
+            put("sshTransport", profile.sshTransport)
 
             // Remote Proxy fields
             put("remoteProxyEnabled", profile.remoteProxyEnabled)

@@ -251,8 +251,14 @@ object VpnConfigParser {
             val remark = uri.fragment?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: "SSH Tunnel"
             val sni = uri.getQueryParameter("sni") ?: ""
             val payload = uri.getQueryParameter("payload")?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: ""
+            val hostHeader = uri.getQueryParameter("host") ?: ""
+            val path = uri.getQueryParameter("path") ?: "/ws"
             val sslParam = uri.getQueryParameter("ssl")
             val isSsl = sslParam?.toBooleanStrictOrNull() ?: (port == 443 || sni.isNotBlank())
+
+            val proxyParam = uri.getQueryParameter("proxy")
+            val proxyHost = proxyParam?.substringBefore(":") ?: ""
+            val proxyPort = proxyParam?.substringAfter(":", "8080")?.toIntOrNull() ?: 8080
 
             VpnProfile(
                 name = remark,
@@ -264,9 +270,14 @@ object VpnConfigParser {
                 sshUsername = username,
                 sshPassword = password,
                 sni = sni,
+                host = hostHeader,
+                path = path,
                 sshPayload = payload,
                 sshDirectSsl = isSsl,
                 security = if (isSsl) "tls" else "none",
+                remoteProxyEnabled = proxyParam != null && proxyHost.isNotBlank(),
+                remoteProxyHost = proxyHost,
+                remoteProxyPort = proxyPort,
                 countryCode = detectCountry(remark, host),
                 rawUri = uriString
             )

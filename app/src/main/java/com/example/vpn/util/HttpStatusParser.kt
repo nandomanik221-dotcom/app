@@ -185,6 +185,25 @@ object HttpStatusParser {
         }
         return if (total == n) buf else buf.copyOf(total)
     }
+
+    /**
+     * Identifies whether an HTTP rejection/response originated from:
+     * A. Remote Proxy
+     * B. Origin Server
+     * C. CDN / Cloudflare
+     * D. Endpoint WebSocket / Middlebox
+     */
+    fun identifyRejectionSource(headers: Map<String, String>, statusLine: String, remoteProxy: String = ""): String {
+        val server = headers["server"]?.lowercase(Locale.ROOT) ?: ""
+        val cfRay = headers["cf-ray"]
+        val via = headers["via"]?.lowercase(Locale.ROOT) ?: ""
+        return when {
+            server.contains("cloudflare") || cfRay != null -> "C. CDN/Cloudflare (Server: ${headers["server"] ?: "cloudflare"}, cf-ray: ${cfRay ?: "present"})"
+            server.contains("squid") || server.contains("tinyproxy") || via.contains("proxy") || via.contains("squid") -> "A. Remote Proxy (${if (remoteProxy.isNotBlank()) remoteProxy else "proxy"})"
+            server.isNotBlank() -> "B. Origin Server (Server: ${headers["server"]})"
+            else -> "D. Endpoint WebSocket / Middlebox ($statusLine)"
+        }
+    }
 }
 
 data class ParsedHttpResponse(

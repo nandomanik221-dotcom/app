@@ -352,6 +352,24 @@ fun AddEditProfileDialog(
                         Spacer(modifier = Modifier.height(10.dp))
 
                         CyberTextField(
+                            value = hostHeader,
+                            onValueChange = { hostHeader = it },
+                            label = "HTTP Host Header (Optional)",
+                            placeholder = "e.g. server domain or bug host"
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        CyberTextField(
+                            value = path,
+                            onValueChange = { path = it },
+                            label = "WebSocket Path (e.g. / or /ws)",
+                            placeholder = "/ws"
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        CyberTextField(
                             value = sshPayload,
                             onValueChange = { sshPayload = it },
                             label = "Custom HTTP / WebSocket Payload",

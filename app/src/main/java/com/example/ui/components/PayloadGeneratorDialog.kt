@@ -104,8 +104,9 @@ fun PayloadGeneratorDialog(
                 sb.append("[crlf]")
             }
             else -> {
-                sb.append("$requestMethod / HTTP/1.1[crlf]")
+                sb.append("$requestMethod [path] HTTP/1.1[crlf]")
                 sb.append("Host: $host[crlf]")
+                if (isUserAgent) sb.append("User-Agent: [ua][crlf]")
                 sb.append("Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]")
             }
         }

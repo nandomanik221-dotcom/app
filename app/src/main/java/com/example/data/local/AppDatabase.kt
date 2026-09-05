@@ -11,7 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-@Database(entities = [VpnProfileEntity::class], version = 4, exportSchema = false)
+@Database(entities = [VpnProfileEntity::class], version = 5, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun vpnProfileDao(): VpnProfileDao
 
@@ -114,20 +114,25 @@ abstract class AppDatabase : RoomDatabase() {
                 ),
                 VpnProfileEntity(
                     id = 5L,
-                    name = "🇮🇩 ID-02 SSH SSL + Custom Payload (Indosat/XL)",
+                    name = "🇮🇩 ID-02 SSH Standard + TLS (Golden Profile)",
                     protocol = "SSH",
-                    server = "id-ssh.v2tunnel.net",
+                    server = "prem.nikuvpn.biz.id",
                     port = 443,
-                    sshUsername = "vpnuser_id",
-                    sshPassword = "free_ssh_password123",
-                    sni = "m.youtube.com",
-                    sshPayload = "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Keep-Alive[crlf][crlf]",
+                    sshUsername = "testione",
+                    sshPassword = "password",
+                    sni = "prem.nikuvpn.biz.id:443",
+                    sshPayload = "GET /cdn-cgi/trace HTTP/1.1[crlf]Host: api.quipper.com[crlf]Connection: Keep-Alive[crlf][crlf]PATCH / HTTP/1.1[crlf]Host: [host]",
                     sshDirectSsl = true,
+                    sshTransport = "STANDARD",
+                    remoteProxyEnabled = true,
+                    remoteProxyType = "HTTP",
+                    remoteProxyHost = "ads.ruangguru.com",
+                    remoteProxyPort = 443,
                     countryCode = "ID",
                     lastPingMs = 28,
                     isPreset = true,
                     isFavorite = false,
-                    rawUri = "ssh://vpnuser_id:free_ssh_password123@id-ssh.v2tunnel.net:443?sni=m.youtube.com&ssl=true#🇮🇩 ID-02 SSH SSL"
+                    rawUri = "ssh://testione:password@prem.nikuvpn.biz.id:443?sni=prem.nikuvpn.biz.id:443&ssl=true&proxy=ads.ruangguru.com:443&transport=STANDARD#🇮🇩 ID-02 SSH Standard + TLS"
                 ),
                 VpnProfileEntity(
                     id = 6L,
