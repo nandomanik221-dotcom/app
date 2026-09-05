@@ -94,7 +94,7 @@ data class VpnProfile(
         get() = when (countryCode.uppercase()) {
             "SG" -> "🇸🇬"
             "ID" -> "🇮🇩"
-            "US" -> "🇲🇨" // Fallback / Indonesia
+            "MC" -> "🇲🇨"
             "US" -> "🇺🇸"
             "JP" -> "🇯🇵"
             "DE" -> "🇩🇪"

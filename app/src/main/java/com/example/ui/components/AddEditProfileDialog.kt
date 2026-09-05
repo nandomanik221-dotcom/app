@@ -83,7 +83,7 @@ fun AddEditProfileDialog(
     var network by remember { mutableStateOf(initialProfile?.network ?: "ws") }
     var security by remember { mutableStateOf(initialProfile?.security ?: "tls") }
     var sni by remember { mutableStateOf(initialProfile?.sni ?: "") }
-    var path by remember { mutableStateOf(initialProfile?.path ?: "/ws") }
+    var path by remember { mutableStateOf(initialProfile?.path ?: if (protocol == VpnProtocol.SSH) "" else "/ws") }
     var hostHeader by remember { mutableStateOf(initialProfile?.host ?: "") }
     var countryCode by remember { mutableStateOf(initialProfile?.countryCode ?: "SG") }
 
@@ -361,19 +361,10 @@ fun AddEditProfileDialog(
                         Spacer(modifier = Modifier.height(10.dp))
 
                         CyberTextField(
-                            value = path,
-                            onValueChange = { path = it },
-                            label = "WebSocket Path (e.g. / or /ws)",
-                            placeholder = "/ws"
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        CyberTextField(
                             value = sshPayload,
                             onValueChange = { sshPayload = it },
-                            label = "Custom HTTP / WebSocket Payload",
-                            placeholder = "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]",
+                            label = "Custom SSH Payload",
+                            placeholder = "GET / HTTP/1.1[crlf]Host: [host][crlf][crlf]",
                             singleLine = false,
                             minLines = 2
                         )
@@ -591,12 +582,13 @@ fun AddEditProfileDialog(
                                 network = network.trim(),
                                 security = if (protocol == VpnProtocol.SSH) (if (sshDirectSsl) "tls" else "none") else security.trim(),
                                 sni = sni.trim(),
-                                path = path.trim(),
+                                path = if (protocol == VpnProtocol.SSH) "" else path.trim(),
                                 host = hostHeader.trim(),
                                 sshUsername = sshUsername.trim(),
                                 sshPassword = sshPassword.trim(),
                                 sshPayload = sshPayload.trim(),
                                 sshDirectSsl = sshDirectSsl,
+                                sshTransport = if (protocol == VpnProtocol.SSH) com.example.model.SshTransport.STANDARD.name else (initialProfile?.sshTransport ?: com.example.model.SshTransport.STANDARD.name),
                                 remoteProxyEnabled = proxyEnabled,
                                 remoteProxyType = proxyType.trim(),
                                 remoteProxyHost = proxyHost.trim(),
