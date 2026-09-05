@@ -652,4 +652,37 @@ class VpnEndToEndIntegrationAuditTest {
         assertEquals(300, readCount)
         assertEquals(payload.toList(), readBuf.toList())
     }
+
+    @Test
+    fun testReferenceProfileFormattingAndStreamHandling() {
+        // Exact reference profile from user audit prompt:
+        // SSH Host: prem.nikuvpn.biz.id:443
+        // Remote Proxy: ads.ruangguru.com:443
+        // Remote Proxy Type: HTTP
+        // Payload: api.quipper.com[crlf]Connection: Keep-Alive[crlf][crlf]PATCH / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]
+        val payloadTemplate = "api.quipper.com[crlf]Connection: Keep-Alive[crlf][crlf]PATCH / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]"
+        val httpHost = "prem.nikuvpn.biz.id"
+        val proxyHost = "ads.ruangguru.com"
+        val proxyPort = 443
+
+        val formatted = payloadTemplate
+            .replace("[host]", httpHost, ignoreCase = true)
+            .replace("[crlf]", "\r\n", ignoreCase = true)
+
+        val expected = "api.quipper.com\r\nConnection: Keep-Alive\r\n\r\nPATCH / HTTP/1.1\r\nHost: prem.nikuvpn.biz.id\r\nUpgrade: websocket\r\n\r\n"
+        assertEquals(expected, formatted)
+
+        // Verify proxy response parsing: HTTP/1.1 200 Connection Established followed by SSH banner
+        val proxyResponse = "HTTP/1.1 200 Connection established\r\nProxy-Agent: Squid/5.2\r\n\r\nSSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n"
+        val inStream = ByteArrayInputStream(proxyResponse.toByteArray(StandardCharsets.UTF_8))
+        val pushbackIn = java.io.PushbackInputStream(inStream, 1024)
+
+        val resp = HttpStatusParser.consumeSingleResponse(pushbackIn)
+        assertNotNull(resp)
+        assertEquals(200, resp?.statusCode)
+        assertEquals(0, resp?.bodyLength)
+
+        val remaining = String(pushbackIn.readBytes(), StandardCharsets.UTF_8)
+        assertTrue(remaining.startsWith("SSH-2.0-OpenSSH_8.9p1"))
+    }
 }
