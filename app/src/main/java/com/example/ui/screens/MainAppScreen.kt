@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.outlined.Home
@@ -57,6 +58,8 @@ import com.example.ui.components.SettingsSheet
 import com.example.ui.theme.CyberBg
 import com.example.ui.theme.CyberBorder
 import com.example.ui.theme.CyberCard
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material3.FloatingActionButton
 import com.example.ui.theme.CyberSurface
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.NeonGreen
@@ -67,10 +70,10 @@ import com.example.ui.theme.TextSecondary
 import com.example.ui.viewmodel.VpnViewModel
 
 enum class MainTab(val title: String, val activeIcon: ImageVector, val inactiveIcon: ImageVector) {
-    DASHBOARD("Home", Icons.Filled.Home, Icons.Outlined.Home),
-    SERVERS("Servers", Icons.Filled.Storage, Icons.Outlined.Storage),
-    TOOLS("Tools", Icons.Filled.AutoAwesome, Icons.Filled.AutoAwesome),
-    LOGS("Logs", Icons.Filled.Terminal, Icons.Outlined.Terminal)
+    DASHBOARD("Beranda", Icons.Filled.Home, Icons.Outlined.Home),
+    SERVERS("Profil", Icons.Filled.Storage, Icons.Outlined.Storage),
+    TOOLS("Panduan", Icons.Filled.AutoAwesome, Icons.Filled.AutoAwesome),
+    LOGS("Pengaturan", Icons.Filled.Settings, Icons.Filled.Settings)
 }
 
 @Composable
@@ -102,6 +105,23 @@ fun MainAppScreen(
 
     Scaffold(
         containerColor = CyberBg,
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = {
+                    editingProfile = null
+                    showAddEditDialog = true
+                },
+                containerColor = NeonCyan,
+                contentColor = Color.Black,
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Add,
+                    contentDescription = "Add VPN Configuration",
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        },
         bottomBar = {
             NavigationBar(
                 containerColor = CyberSurface,

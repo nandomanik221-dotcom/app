@@ -39,6 +39,10 @@ data class VpnProfile(
     val sshPayload: String = "",         // Custom HTTP / WebSocket payload
     val sshDirectSsl: Boolean = true,
     val sshTransport: String = SshTransport.STANDARD.name, // "STANDARD", "HCR", "WEBSOCKET"
+    val sniVersion: String = "Default",  // "Default", "TLSv1.2", "TLSv1.3"
+    val allowInsecure: Boolean = false,  // Skip server certificate verification
+    val sshPayloadEnabled: Boolean = true, // Whether to inject custom payload
+    val sshMethod: String = "TLS",       // "Enhanced", "TLS", "SlowDNS"
 
     // Remote Proxy ("Proxy Jarak Jauh") Configuration
     val remoteProxyEnabled: Boolean = false,
@@ -64,7 +68,7 @@ data class VpnProfile(
     val proxyPassword: String get() = remoteProxyPassword ?: ""
 
     val isTls: Boolean
-        get() = security.equals("tls", ignoreCase = true) || security.equals("reality", ignoreCase = true)
+        get() = security.equals("tls", ignoreCase = true) || security.equals("reality", ignoreCase = true) || (protocol == VpnProtocol.SSH && (sshMethod.equals("TLS", ignoreCase = true) || sshDirectSsl))
 
     val wsHost: String
         get() = host

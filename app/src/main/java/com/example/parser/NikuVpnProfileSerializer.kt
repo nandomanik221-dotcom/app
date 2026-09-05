@@ -54,6 +54,10 @@ object NikuVpnProfileSerializer {
             put("sshDirectSsl", profile.sshDirectSsl)
             put("sshPayload", profile.sshPayload)
             put("sshTransport", profile.sshTransport)
+            put("sniVersion", profile.sniVersion)
+            put("allowInsecure", profile.allowInsecure)
+            put("sshPayloadEnabled", profile.sshPayloadEnabled)
+            put("sshMethod", profile.sshMethod)
 
             // Remote Proxy fields
             put("remoteProxyEnabled", profile.remoteProxyEnabled)
@@ -113,6 +117,11 @@ object NikuVpnProfileSerializer {
 
             val sshDirectSsl = profObj.optBoolean("sshDirectSsl", true)
             val sshPayload = profObj.optString("sshPayload", "")
+            val sshTransport = profObj.optString("sshTransport", "STANDARD")
+            val sniVersion = profObj.optString("sniVersion", "Default")
+            val allowInsecure = profObj.optBoolean("allowInsecure", false)
+            val sshPayloadEnabled = profObj.optBoolean("sshPayloadEnabled", true)
+            val sshMethod = profObj.optString("sshMethod", if (sshDirectSsl) "TLS" else "Enhanced")
 
             val remoteProxyEnabled = profObj.optBoolean("remoteProxyEnabled", profObj.optBoolean("proxyEnabled", false))
             val remoteProxyType = profObj.optString("remoteProxyType", profObj.optString("proxyType", "HTTP"))
@@ -162,6 +171,11 @@ object NikuVpnProfileSerializer {
                 sshPassword = password,
                 sshPayload = sshPayload,
                 sshDirectSsl = sshDirectSsl,
+                sshTransport = sshTransport,
+                sniVersion = sniVersion,
+                allowInsecure = allowInsecure,
+                sshPayloadEnabled = sshPayloadEnabled,
+                sshMethod = sshMethod,
                 remoteProxyEnabled = remoteProxyEnabled,
                 remoteProxyType = remoteProxyType,
                 remoteProxyHost = remoteProxyHost,

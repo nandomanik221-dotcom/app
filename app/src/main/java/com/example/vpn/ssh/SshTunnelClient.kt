@@ -347,9 +347,9 @@ class SshTunnelClient(
 
         val targetHost = profile.server.trim()
         val targetPort = profile.port
-        val isSsl = profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
+        val isSsl = profile.sshMethod.equals("TLS", ignoreCase = true) || profile.sshDirectSsl || profile.security.equals("tls", ignoreCase = true)
         val hasRemoteProxy = profile.remoteProxyEnabled && profile.remoteProxyHost.isNotBlank()
-        val hasPayload = profile.sshPayload.isNotBlank()
+        val hasPayload = profile.sshPayloadEnabled && profile.sshPayload.isNotBlank()
 
         val proxyHost = if (hasRemoteProxy) profile.remoteProxyHost.trim() else "NONE"
         val proxyPort = if (hasRemoteProxy && profile.remoteProxyPort > 0) profile.remoteProxyPort else if (hasRemoteProxy) 8080 else 0
@@ -395,16 +395,15 @@ ALPN=$alpn"""
                 performSocks5ProxyHandshake(currentSocket, targetHost, targetPort)
 
                 if (isSsl) {
-                    currentSocket = performTlsHandshake(currentSocket, targetHost, targetPort)
+                    currentSocket = performTlsHandshake(currentSocket, cleanSni, proxyPort)
                 }
                 if (hasPayload) {
                     currentSocket = handleCustomPayload(currentSocket, targetHost, targetPort)
                 }
             } else {
                 // HTTP / HTTPS Remote Proxy
-                if (proxyPort == 443 || isSsl) {
-                    // Remote Proxy is an SSL/TLS endpoint (e.g. ads.ruangguru.com:443)
-                    // Establish TLS with SNI = cleanSni (prem.nikuvpn.biz.id)
+                if (isSsl) {
+                    // Encapsulate with TLS using cleanSni
                     currentSocket = performTlsHandshake(currentSocket, cleanSni, proxyPort)
 
                     // Inject custom payload inside TLS
@@ -630,12 +629,33 @@ ALPN=$alpn"""
     private fun performTlsHandshake(rawSocket: Socket, peerHost: String, peerPort: Int): Socket {
         val rawSni = profile.sni.trim().ifBlank { peerHost }
         val cleanSni = SniUtils.sanitizeSni(rawSni, peerHost)
-        VpnLogManager.log(LogLevel.CONN, "TLS", "[TLS] Encapsulating with SNI: $cleanSni")
+        VpnLogManager.log(LogLevel.CONN, "TLS", "[TLS] Encapsulating with SNI: $cleanSni (Version: ${profile.sniVersion}, Insecure: ${profile.allowInsecure})")
 
-        val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+        val sslFactory: SSLSocketFactory = if (profile.allowInsecure) {
+            val trustAllCerts = arrayOf<javax.net.ssl.TrustManager>(object : javax.net.ssl.X509TrustManager {
+                override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+                override fun checkClientTrusted(certs: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(certs: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+            })
+            val sslContext = javax.net.ssl.SSLContext.getInstance("TLS")
+            sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+            sslContext.socketFactory
+        } else {
+            SSLSocketFactory.getDefault() as SSLSocketFactory
+        }
+
         val sslSocket = sslFactory.createSocket(rawSocket, cleanSni, peerPort, true) as SSLSocket
         try {
             socketProtector.protect(sslSocket)
+        } catch (_: Exception) {}
+
+        val enabledProtos = when (profile.sniVersion) {
+            "TLSv1.3" -> arrayOf("TLSv1.3")
+            "TLSv1.2" -> arrayOf("TLSv1.2")
+            else -> arrayOf("TLSv1.3", "TLSv1.2")
+        }
+        try {
+            sslSocket.enabledProtocols = enabledProtos
         } catch (_: Exception) {}
 
         val sslParams = SSLParameters().apply {
@@ -797,16 +817,18 @@ sec_key=PRESENT"""
                 break
             }
         }
-        val peekBuf = ByteArray(5)
+        val peekBuf = ByteArray(8)
         var readCount = 0
         try {
-            while (readCount < 5) {
+            while (readCount < 8) {
                 val b = pushbackIn.read()
                 if (b == -1) break
                 peekBuf[readCount++] = b.toByte()
-                if (readCount < 5 && pushbackIn.available() == 0) {
+                if (readCount < 8 && pushbackIn.available() == 0) {
                     val currentStr = String(peekBuf, 0, readCount, StandardCharsets.US_ASCII)
-                    if (!"HTTP/".startsWith(currentStr, ignoreCase = true) && !currentStr.startsWith("\r") && !currentStr.startsWith("\n")) {
+                    if (!"HTTP/".startsWith(currentStr, ignoreCase = true) &&
+                        !"SSH-".startsWith(currentStr, ignoreCase = true) &&
+                        !currentStr.startsWith("\r") && !currentStr.startsWith("\n")) {
                         break
                     }
                 }
@@ -815,8 +837,12 @@ sec_key=PRESENT"""
 
         if (readCount > 0) {
             pushbackIn.unread(peekBuf, 0, readCount)
-            val peekStr = String(peekBuf, 0, readCount, StandardCharsets.US_ASCII)
-            return peekStr.trimStart().startsWith("HTTP/", ignoreCase = true)
+            val peekStr = String(peekBuf, 0, readCount, StandardCharsets.US_ASCII).trimStart()
+            if (peekStr.startsWith("SSH-", ignoreCase = true)) {
+                VpnLogManager.log(LogLevel.CONN, "SSH", "[SSH] Raw SSH banner detected on stream ($peekStr)")
+                return false
+            }
+            return peekStr.startsWith("HTTP/", ignoreCase = true)
         }
         return false
     }
@@ -877,12 +903,12 @@ sec_key=PRESENT"""
     )
 
     /**
-     * Splits a raw payload template by [split], [delay_split], or [instant_split].
+     * Splits a raw payload template by [split], [splitNoDelay], [delay_split], [split_delay], [delay], or [instant_split].
      */
     fun splitPayloadStages(rawPayload: String): List<PayloadStage> {
         if (rawPayload.isBlank()) return emptyList()
 
-        val pattern = Regex("(?i)\\[(split|delay_split|instant_split)\\]")
+        val pattern = Regex("(?i)\\[(split|splitNoDelay|instant_split|delay|delay_split|split_delay)\\]")
         val matches = pattern.findAll(rawPayload).toList()
         if (matches.isEmpty()) {
             return listOf(PayloadStage(template = rawPayload, delayMs = 0, isLast = true))
@@ -894,7 +920,10 @@ sec_key=PRESENT"""
             val match = matches[i]
             val chunk = rawPayload.substring(lastIdx, match.range.first)
             val tag = match.groupValues[1].lowercase(Locale.ROOT)
-            val delay = if (tag == "delay_split") 100L else 0L
+            val delay = when (tag) {
+                "delay_split", "split_delay", "delay" -> 100L
+                else -> 0L
+            }
             if (chunk.isNotBlank() || stages.isNotEmpty()) {
                 stages.add(PayloadStage(template = chunk, delayMs = delay, isLast = false))
             }
@@ -940,9 +969,12 @@ sec_key=PRESENT"""
             .replace("[path]", wsPath, ignoreCase = true)
             .replace("[raw_host]", targetHost, ignoreCase = true)
             .replace("[protocol]", "HTTP/1.1", ignoreCase = true)
+            .replace("[lfcr]", "\n\r", ignoreCase = true)
             .replace("[crlf]", "\r\n", ignoreCase = true)
             .replace("[lf]", "\n", ignoreCase = true)
             .replace("[cr]", "\r", ignoreCase = true)
+            .replace("\\r", "\r")
+            .replace("\\n", "\n")
             .replace("[ua]", "Mozilla/5.0 (Linux; Android 16; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36", ignoreCase = true)
             .replace("[real_raw]", "", ignoreCase = true)
 

@@ -252,9 +252,14 @@ object VpnConfigParser {
             val sni = uri.getQueryParameter("sni") ?: ""
             val payload = uri.getQueryParameter("payload")?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) } ?: ""
             val hostHeader = uri.getQueryParameter("host") ?: ""
-            val path = uri.getQueryParameter("path") ?: "/ws"
+            val path = uri.getQueryParameter("path") ?: ""
             val sslParam = uri.getQueryParameter("ssl")
-            val isSsl = sslParam?.toBooleanStrictOrNull() ?: (port == 443 || sni.isNotBlank())
+            val methodParam = uri.getQueryParameter("method") ?: uri.getQueryParameter("mode") ?: if (sslParam?.toBooleanStrictOrNull() == true) "TLS" else "Enhanced"
+            val isSsl = sslParam?.toBooleanStrictOrNull() ?: methodParam.equals("TLS", ignoreCase = true)
+            val transportParam = uri.getQueryParameter("transport") ?: "STANDARD"
+            val sniVersion = uri.getQueryParameter("sniVersion") ?: "Default"
+            val allowInsecure = uri.getQueryParameter("insecure")?.toBooleanStrictOrNull() ?: false
+            val payloadEnabled = uri.getQueryParameter("payloadEnabled")?.toBooleanStrictOrNull() ?: payload.isNotBlank()
 
             val proxyParam = uri.getQueryParameter("proxy")
             val proxyHost = proxyParam?.substringBefore(":") ?: ""
@@ -274,6 +279,11 @@ object VpnConfigParser {
                 path = path,
                 sshPayload = payload,
                 sshDirectSsl = isSsl,
+                sshTransport = transportParam,
+                sniVersion = sniVersion,
+                allowInsecure = allowInsecure,
+                sshPayloadEnabled = payloadEnabled,
+                sshMethod = methodParam,
                 security = if (isSsl) "tls" else "none",
                 remoteProxyEnabled = proxyParam != null && proxyHost.isNotBlank(),
                 remoteProxyHost = proxyHost,

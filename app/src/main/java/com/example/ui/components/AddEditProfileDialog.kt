@@ -92,6 +92,19 @@ fun AddEditProfileDialog(
     var sshPassword by remember { mutableStateOf(initialProfile?.sshPassword?.ifBlank { initialProfile.password } ?: "") }
     var sshPayload by remember { mutableStateOf(initialProfile?.sshPayload ?: "") }
     var sshDirectSsl by remember { mutableStateOf(initialProfile?.sshDirectSsl ?: true) }
+    var sniVersion by remember { mutableStateOf(initialProfile?.sniVersion ?: "Default") }
+    var allowInsecure by remember { mutableStateOf(initialProfile?.allowInsecure ?: false) }
+    var sshTransport by remember { mutableStateOf(initialProfile?.sshTransport ?: com.example.model.SshTransport.STANDARD.name) }
+    var sshPayloadEnabled by remember { mutableStateOf(initialProfile?.sshPayloadEnabled ?: true) }
+    var sshMethod by remember { mutableStateOf(initialProfile?.sshMethod ?: "TLS") }
+
+    var sshHostPortInput by remember {
+        val initialCombined = if (server.isNotBlank()) {
+            val p = port.toIntOrNull() ?: 22
+            com.example.parser.HostPortParser.format(server, p)
+        } else ""
+        mutableStateOf(initialCombined)
+    }
 
     // Remote Proxy
     var proxyEnabled by remember { mutableStateOf(initialProfile?.remoteProxyEnabled ?: initialProfile?.proxyEnabled ?: false) }
@@ -219,335 +232,158 @@ fun AddEditProfileDialog(
                     value = name,
                     onValueChange = { name = it },
                     label = "Profile Name / Remark",
-                    placeholder = "e.g. 🇸🇬 SG-01 Fast Trojan"
+                    placeholder = if (protocol == VpnProtocol.SSH) "e.g. 🇮🇩 SSH Standard" else "e.g. 🇸🇬 SG-01 Fast Trojan"
                 )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
-                // Server Address & Port Row
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    CyberTextField(
-                        value = server,
-                        onValueChange = { server = it },
-                        label = "Server / Domain / IP",
-                        placeholder = "sg01.v2tunnel.net",
-                        modifier = Modifier.weight(2.5f)
-                    )
-
-                    CyberTextField(
-                        value = port,
-                        onValueChange = { port = it },
-                        label = "Port",
-                        placeholder = "443",
-                        modifier = Modifier.weight(1.2f)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Country Code
-                CyberTextField(
-                    value = countryCode,
-                    onValueChange = { countryCode = it.take(2).uppercase() },
-                    label = "Country Code (Flag)",
-                    placeholder = "SG, ID, US, JP, DE, HK"
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Protocol Specific Fields
-                when (protocol) {
-                    VpnProtocol.TROJAN, VpnProtocol.VLESS, VpnProtocol.VMESS -> {
-                        CyberTextField(
-                            value = password,
-                            onValueChange = { password = it },
-                            label = if (protocol == VpnProtocol.TROJAN) "Trojan Password" else "UUID / User ID",
-                            placeholder = "Enter password or UUID"
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        // SNI / Bug Host
-                        CyberTextField(
-                            value = sni,
-                            onValueChange = { sni = it },
-                            label = "SNI / Server Name Indication (Bug Host)",
-                            placeholder = "e.g. speed.cloudflare.com"
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            CyberTextField(
-                                value = network,
-                                onValueChange = { network = it },
-                                label = "Network",
-                                placeholder = "ws / grpc / tcp",
-                                modifier = Modifier.weight(1f)
-                            )
-                            CyberTextField(
-                                value = path,
-                                onValueChange = { path = it },
-                                label = "Path",
-                                placeholder = "/v2ray-ws",
-                                modifier = Modifier.weight(1f)
-                            )
+                if (protocol == VpnProtocol.SSH) {
+                    // Standard SSH UI (matching HTTP Custom / NikuVPN specifications)
+                    SshConfigSection(
+                        sni = sni,
+                        onSniChange = { sni = it },
+                        sniVersion = sniVersion,
+                        onSniVersionChange = { sniVersion = it },
+                        allowInsecure = allowInsecure,
+                        onAllowInsecureChange = { allowInsecure = it },
+                        sshHostPort = sshHostPortInput,
+                        onSshHostPortChange = { input ->
+                            sshHostPortInput = input
+                            val parsed = com.example.parser.HostPortParser.parse(input, defaultPort = 22)
+                            if (parsed != null) {
+                                server = parsed.host
+                                port = parsed.port.toString()
+                            } else {
+                                server = input.trim()
+                            }
+                        },
+                        sshUsername = sshUsername,
+                        onSshUsernameChange = { sshUsername = it },
+                        sshPassword = sshPassword,
+                        onSshPasswordChange = { sshPassword = it },
+                        sshTransport = sshTransport,
+                        onSshTransportChange = { sshTransport = it },
+                        sshPayloadEnabled = sshPayloadEnabled,
+                        onSshPayloadEnabledChange = { sshPayloadEnabled = it },
+                        sshMethod = sshMethod,
+                        onSshMethodChange = { methodChoice ->
+                            sshMethod = methodChoice
+                            sshDirectSsl = methodChoice.equals("TLS", ignoreCase = true)
+                        },
+                        sshPayload = sshPayload,
+                        onSshPayloadChange = { sshPayload = it },
+                        remoteProxy = rawProxyAddressInput,
+                        onRemoteProxyChange = { input ->
+                            rawProxyAddressInput = input
+                            val parsed = com.example.parser.RemoteProxyAddressParser.parse(input)
+                            if (parsed != null) {
+                                proxyHost = parsed.host
+                                proxyPort = parsed.port.toString()
+                                proxyUsername = parsed.username ?: ""
+                                proxyPassword = parsed.password ?: ""
+                                proxyEnabled = true
+                            } else {
+                                proxyHost = input.trim()
+                                proxyEnabled = input.isNotBlank()
+                            }
                         }
-                    }
-
-                    VpnProtocol.SHADOWSOCKS -> {
+                    )
+                } else {
+                    // Non-SSH protocols (Trojan, VLESS, VMess, Shadowsocks)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         CyberTextField(
-                            value = password,
-                            onValueChange = { password = it },
-                            label = "Shadowsocks Password / Secret",
-                            placeholder = "Enter encryption key"
+                            value = server,
+                            onValueChange = { server = it },
+                            label = "Server / Domain / IP",
+                            placeholder = "sg01.v2tunnel.net",
+                            modifier = Modifier.weight(2.5f)
                         )
 
-                        Spacer(modifier = Modifier.height(10.dp))
-
                         CyberTextField(
-                            value = method,
-                            onValueChange = { method = it },
-                            label = "Encryption Method (AEAD)",
-                            placeholder = "chacha20-ietf-poly1305 / aes-256-gcm"
+                            value = port,
+                            onValueChange = { port = it },
+                            label = "Port",
+                            placeholder = "443",
+                            modifier = Modifier.weight(1.2f)
                         )
                     }
 
-                    VpnProtocol.SSH -> {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Country Code
+                    CyberTextField(
+                        value = countryCode,
+                        onValueChange = { countryCode = it.take(2).uppercase() },
+                        label = "Country Code (Flag)",
+                        placeholder = "SG, ID, US, JP, DE, HK"
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    when (protocol) {
+                        VpnProtocol.TROJAN, VpnProtocol.VLESS, VpnProtocol.VMESS -> {
                             CyberTextField(
-                                value = sshUsername,
-                                onValueChange = { sshUsername = it },
-                                label = "SSH Username",
-                                placeholder = "root / vpnuser",
-                                modifier = Modifier.weight(1f)
+                                value = password,
+                                onValueChange = { password = it },
+                                label = if (protocol == VpnProtocol.TROJAN) "Trojan Password" else "UUID / User ID",
+                                placeholder = "Enter password or UUID"
                             )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
                             CyberTextField(
-                                value = sshPassword,
-                                onValueChange = { sshPassword = it },
-                                label = "SSH Password",
-                                placeholder = "password",
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        CyberTextField(
-                            value = sni,
-                            onValueChange = { sni = it },
-                            label = "SNI / Bug Host (Separate Field)",
-                            placeholder = "e.g. m.youtube.com / line.me"
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        CyberTextField(
-                            value = hostHeader,
-                            onValueChange = { hostHeader = it },
-                            label = "HTTP Host Header (Optional)",
-                            placeholder = "e.g. server domain or bug host"
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        CyberTextField(
-                            value = sshPayload,
-                            onValueChange = { sshPayload = it },
-                            label = "Custom SSH Payload",
-                            placeholder = "GET / HTTP/1.1[crlf]Host: [host][crlf][crlf]",
-                            singleLine = false,
-                            minLines = 2
-                        )
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        // Direct SSL/TLS Mode Switch
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text(
-                                    text = "Direct SSL/TLS Mode",
-                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = TextPrimary
-                                )
-                                Text(
-                                    text = "Wraps SSH connection inside TLS using SNI",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = TextMuted
-                                )
-                            }
-                            Switch(
-                                checked = sshDirectSsl,
-                                onCheckedChange = { sshDirectSsl = it },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = NeonCyan,
-                                    checkedTrackColor = NeonCyan.copy(alpha = 0.4f)
-                                )
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        // Remote Proxy Configuration Section (HTTP Custom style "Proxy Jarak Jauh")
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text(
-                                    text = "Proxy Jarak Jauh (Remote Proxy)",
-                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = TextPrimary
-                                )
-                                Text(
-                                    text = "Route SSH handshake via HTTP CONNECT / SOCKS5 proxy",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = TextMuted
-                                )
-                            }
-                            Switch(
-                                checked = proxyEnabled,
-                                onCheckedChange = { proxyEnabled = it },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = NeonGreen,
-                                    checkedTrackColor = NeonGreen.copy(alpha = 0.4f)
-                                )
-                            )
-                        }
-
-                        if (proxyEnabled) {
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // HTTP Custom unified format input: host:port or user:pass@host:port or user:pass@[IPv6]:port
-                            CyberTextField(
-                                value = rawProxyAddressInput,
-                                onValueChange = { input ->
-                                    rawProxyAddressInput = input
-                                    val parsed = com.example.parser.RemoteProxyAddressParser.parse(input)
-                                    if (parsed != null) {
-                                        proxyHost = parsed.host
-                                        proxyPort = parsed.port.toString()
-                                        if (parsed.username != null) proxyUsername = parsed.username
-                                        if (parsed.password != null) proxyPassword = parsed.password
-                                    }
-                                },
-                                label = "Proxy Jarak Jauh [ host:port / user:pass@host:port ]",
-                                placeholder = "ads.ruangguru.com:443 or user:pass@104.21.56.88:8080"
+                                value = sni,
+                                onValueChange = { sni = it },
+                                label = "SNI / Server Name Indication (Bug Host)",
+                                placeholder = "e.g. speed.cloudflare.com"
                             )
 
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // Proxy Type selector: [ HTTP ] [ SOCKS5 ]
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Proxy Type:",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = TextSecondary
-                                )
-                                listOf("HTTP", "SOCKS5").forEach { type ->
-                                    val isTypeSel = proxyType.equals(type, ignoreCase = true)
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(8.dp))
-                                            .background(if (isTypeSel) NeonGreen.copy(alpha = 0.2f) else CyberCard)
-                                            .border(1.dp, if (isTypeSel) NeonGreen else CyberBorder, RoundedCornerShape(8.dp))
-                                            .clickable { proxyType = type }
-                                            .padding(horizontal = 14.dp, vertical = 6.dp)
-                                    ) {
-                                        Text(
-                                            text = type,
-                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                            color = if (isTypeSel) NeonGreen else TextMuted
-                                        )
-                                    }
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // Optional separate Host & Port granular controls
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                CyberTextField(
-                                    value = proxyHost,
-                                    onValueChange = {
-                                        proxyHost = it
-                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
-                                            proxyHost, proxyPort.toIntOrNull() ?: 8080, proxyUsername.ifBlank { null }, proxyPassword.ifBlank { null }
-                                        )
-                                    },
-                                    label = "Host / IP",
-                                    placeholder = "104.21.56.88",
-                                    modifier = Modifier.weight(2.5f)
-                                )
-                                CyberTextField(
-                                    value = proxyPort,
-                                    onValueChange = {
-                                        proxyPort = it
-                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
-                                            proxyHost, it.toIntOrNull() ?: 8080, proxyUsername.ifBlank { null }, proxyPassword.ifBlank { null }
-                                        )
-                                    },
-                                    label = "Port",
-                                    placeholder = "8080",
-                                    modifier = Modifier.weight(1.2f)
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(10.dp))
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 CyberTextField(
-                                    value = proxyUsername,
-                                    onValueChange = {
-                                        proxyUsername = it
-                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
-                                            proxyHost, proxyPort.toIntOrNull() ?: 8080, it.ifBlank { null }, proxyPassword.ifBlank { null }
-                                        )
-                                    },
-                                    label = "Username (opsional)",
-                                    placeholder = "user",
+                                    value = network,
+                                    onValueChange = { network = it },
+                                    label = "Network",
+                                    placeholder = "ws / grpc / tcp",
                                     modifier = Modifier.weight(1f)
                                 )
                                 CyberTextField(
-                                    value = proxyPassword,
-                                    onValueChange = {
-                                        proxyPassword = it
-                                        rawProxyAddressInput = com.example.parser.RemoteProxyAddressParser.format(
-                                            proxyHost, proxyPort.toIntOrNull() ?: 8080, proxyUsername.ifBlank { null }, it.ifBlank { null }
-                                        )
-                                    },
-                                    label = "Password (opsional)",
-                                    placeholder = "pass",
+                                    value = path,
+                                    onValueChange = { path = it },
+                                    label = "Path",
+                                    placeholder = "/v2ray-ws",
                                     modifier = Modifier.weight(1f)
                                 )
                             }
                         }
+
+                        VpnProtocol.SHADOWSOCKS -> {
+                            CyberTextField(
+                                value = password,
+                                onValueChange = { password = it },
+                                label = "Shadowsocks Password / Secret",
+                                placeholder = "Enter encryption key"
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            CyberTextField(
+                                value = method,
+                                onValueChange = { method = it },
+                                label = "Encryption Method (AEAD)",
+                                placeholder = "chacha20-ietf-poly1305 / aes-256-gcm"
+                            )
+                        }
+
+                        else -> {}
                     }
-                    else -> {}
                 }
 
                 Spacer(modifier = Modifier.height(20.dp))
@@ -564,9 +400,22 @@ fun AddEditProfileDialog(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            val parsedPort = port.toIntOrNull() ?: 443
+                            if (protocol == VpnProtocol.SSH && sshHostPortInput.isNotBlank()) {
+                                val parsed = com.example.parser.HostPortParser.parse(sshHostPortInput, defaultPort = 22)
+                                if (parsed != null) {
+                                    server = parsed.host
+                                    port = parsed.port.toString()
+                                }
+                            }
+                            val parsedPort = port.toIntOrNull() ?: if (protocol == VpnProtocol.SSH) 22 else 443
                             val parsedProxyPort = proxyPort.toIntOrNull() ?: 8080
-                            val finalName = if (name.isNotBlank()) name else "${protocol.displayName} Server"
+                            val finalName = if (name.isNotBlank()) {
+                                name
+                            } else if (protocol == VpnProtocol.SSH) {
+                                "SSH Standard (${server.ifBlank { "Server" }})"
+                            } else {
+                                "${protocol.displayName} Server"
+                            }
                             val effectiveUser = if (protocol == VpnProtocol.SSH) sshUsername.trim() else password.trim()
                             val effectivePass = if (protocol == VpnProtocol.SSH) sshPassword.trim() else password.trim()
 
@@ -580,16 +429,20 @@ fun AddEditProfileDialog(
                                 password = effectivePass,
                                 method = method.trim(),
                                 network = network.trim(),
-                                security = if (protocol == VpnProtocol.SSH) (if (sshDirectSsl) "tls" else "none") else security.trim(),
+                                security = if (protocol == VpnProtocol.SSH) (if (sshMethod == "TLS" || sshDirectSsl) "tls" else "none") else security.trim(),
                                 sni = sni.trim(),
                                 path = if (protocol == VpnProtocol.SSH) "" else path.trim(),
-                                host = hostHeader.trim(),
+                                host = if (protocol == VpnProtocol.SSH) "" else hostHeader.trim(),
                                 sshUsername = sshUsername.trim(),
                                 sshPassword = sshPassword.trim(),
                                 sshPayload = sshPayload.trim(),
                                 sshDirectSsl = sshDirectSsl,
-                                sshTransport = if (protocol == VpnProtocol.SSH) com.example.model.SshTransport.STANDARD.name else (initialProfile?.sshTransport ?: com.example.model.SshTransport.STANDARD.name),
-                                remoteProxyEnabled = proxyEnabled,
+                                sshTransport = if (protocol == VpnProtocol.SSH) sshTransport else (initialProfile?.sshTransport ?: com.example.model.SshTransport.STANDARD.name),
+                                sniVersion = sniVersion,
+                                allowInsecure = allowInsecure,
+                                sshPayloadEnabled = sshPayloadEnabled,
+                                sshMethod = sshMethod,
+                                remoteProxyEnabled = proxyEnabled && proxyHost.isNotBlank(),
                                 remoteProxyType = proxyType.trim(),
                                 remoteProxyHost = proxyHost.trim(),
                                 remoteProxyPort = parsedProxyPort,
@@ -602,7 +455,8 @@ fun AddEditProfileDialog(
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
                         shape = RoundedCornerShape(12.dp),
-                        enabled = server.isNotBlank()
+                        enabled = (protocol == VpnProtocol.SSH && (server.isNotBlank() || sshHostPortInput.isNotBlank())) ||
+                                (protocol != VpnProtocol.SSH && server.isNotBlank())
                     ) {
                         Icon(Icons.Default.Save, contentDescription = null, tint = Color.Black, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
@@ -622,7 +476,9 @@ fun CyberTextField(
     placeholder: String = "",
     modifier: Modifier = Modifier,
     singleLine: Boolean = true,
-    minLines: Int = 1
+    minLines: Int = 1,
+    visualTransformation: androidx.compose.ui.text.input.VisualTransformation = androidx.compose.ui.text.input.VisualTransformation.None,
+    trailingIcon: @Composable (() -> Unit)? = null
 ) {
     OutlinedTextField(
         value = value,
@@ -631,6 +487,8 @@ fun CyberTextField(
         placeholder = { Text(placeholder, color = TextMuted, fontSize = 12.sp) },
         singleLine = singleLine,
         minLines = minLines,
+        visualTransformation = visualTransformation,
+        trailingIcon = trailingIcon,
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
         colors = OutlinedTextFieldDefaults.colors(

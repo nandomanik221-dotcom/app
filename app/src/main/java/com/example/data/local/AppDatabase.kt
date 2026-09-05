@@ -11,7 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-@Database(entities = [VpnProfileEntity::class], version = 5, exportSchema = false)
+@Database(entities = [VpnProfileEntity::class], version = 6, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun vpnProfileDao(): VpnProfileDao
 
@@ -119,9 +119,13 @@ abstract class AppDatabase : RoomDatabase() {
                     server = "prem.nikuvpn.biz.id",
                     port = 443,
                     sshUsername = "testione",
-                    sshPassword = "password",
+                    sshPassword = "wero",
                     sni = "prem.nikuvpn.biz.id:443",
-                    sshPayload = "GET /cdn-cgi/trace HTTP/1.1[crlf]Host: api.quipper.com[crlf]Connection: Keep-Alive[crlf][crlf]PATCH / HTTP/1.1[crlf]Host: [host]",
+                    sniVersion = "Default",
+                    allowInsecure = false,
+                    sshPayloadEnabled = true,
+                    sshMethod = "TLS",
+                    sshPayload = "api.quipper.com[crlf]Connection: Keep-Alive[crlf][crlf]PATCH / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]",
                     sshDirectSsl = true,
                     sshTransport = "STANDARD",
                     remoteProxyEnabled = true,
@@ -132,7 +136,7 @@ abstract class AppDatabase : RoomDatabase() {
                     lastPingMs = 28,
                     isPreset = true,
                     isFavorite = false,
-                    rawUri = "ssh://testione:password@prem.nikuvpn.biz.id:443?sni=prem.nikuvpn.biz.id:443&ssl=true&proxy=ads.ruangguru.com:443&transport=STANDARD#🇮🇩 ID-02 SSH Standard + TLS"
+                    rawUri = "ssh://testione:wero@prem.nikuvpn.biz.id:443?sni=prem.nikuvpn.biz.id:443&ssl=true&proxy=ads.ruangguru.com:443&transport=STANDARD#🇮🇩 ID-02 SSH Standard + TLS"
                 ),
                 VpnProfileEntity(
                     id = 6L,
